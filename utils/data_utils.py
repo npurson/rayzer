@@ -19,11 +19,15 @@ def create_video_from_frames(frames, output_video_file, framerate=30):
         output_video_file (str): Path to save the output video file.
         framerate (int, optional): Frames per second for the video. Default is 30.
     """
-    frames = np.asarray(frames)
+    frames = np.asarray(frames, dtype=np.float32)
 
-    # Normalize frames if values are in [0,1] range
-    if frames.max() <= 1:
-        frames = (frames * 255).astype(np.uint8)
+    # Handle NaN and Inf values
+    if not np.isfinite(frames).all():
+        frames = np.nan_to_num(frames, nan=0.0, posinf=1.0, neginf=0.0)
+    
+    # Clip to valid range and convert to uint8
+    frames = np.clip(frames, 0.0, 1.0)
+    frames = (frames * 255).astype(np.uint8)
 
     imageio.mimsave(output_video_file, frames, fps=framerate, quality=8)
 
@@ -249,8 +253,8 @@ class SplitData(nn.Module):
             input_dict[key] = value[batch_idx, input_pattern, ...]
             target_dict[key] = value[batch_idx, target_pattern, ...]
         
-        # input_dict['scene_name'] = data_batch['scene_name']
-        # target_dict['scene_name'] = data_batch['scene_name']
+        input_dict['scene_name'] = data_batch['scene_name']
+        target_dict['scene_name'] = data_batch['scene_name']
                 
         return edict(input_dict), edict(target_dict), input_pattern, target_pattern
 

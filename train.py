@@ -117,7 +117,7 @@ start_train_step = cur_train_step
 model.train()
 
 # Set up curriculum-related variables
-num_fwdbwd_passes_per_epoch = max(1, int(len(dataset) / batch_size_per_gpu))
+num_fwdbwd_passes_per_epoch = max(1, int(len(dataset) / (batch_size_per_gpu * ddp_info.world_size)))
 if config.training.view_selector.get('use_curriculum', False):
     max_iter_epoch = config.training.get('max_iter_epoch', 100)  # use a small number for iter per epoch, more flexible for curriculum
     num_fwdbwd_passes_per_epoch = min(num_fwdbwd_passes_per_epoch, max_iter_epoch)
@@ -131,9 +131,7 @@ while cur_train_step <= total_train_steps:
     
     # Update dataloader
     if cur_train_step % num_fwdbwd_passes_per_epoch == 0:
-        print(f"ddp_rank={ddp_info.local_rank}, Resetting dataloader epoch to {cur_epoch}; might take a while...")
         if config.training.view_selector.get('use_curriculum', False):
-            print(f"ddp_rank={ddp_info.local_rank}, Resetting dataset iteration number to {cur_train_step}; might take a while...")
             dataset.update_iteration(cur_train_step)  # update dataset iter number for setting view interval for curriculum
             dataloader = DataLoader(
                 dataset,
@@ -150,7 +148,13 @@ while cur_train_step <= total_train_steps:
         dataloader_iter = iter(dataloader)
 
     # Forward pass
-    data = next(dataloader_iter)
+    try:
+        data = next(dataloader_iter)
+    except StopIteration:
+        cur_epoch += 1
+        datasampler.set_epoch(cur_epoch)
+        dataloader_iter = iter(dataloader)
+        data = next(dataloader_iter)
     batch = {k: v.to(ddp_info.device) if type(v) == torch.Tensor else v for k, v in data.items()}
 
     create_visual = ((cur_train_step-1) == start_train_step) or (cur_train_step % config.training.vis_every == 0)
@@ -171,10 +175,10 @@ while cur_train_step <= total_train_steps:
     # Backward pass
     update_grads = (cur_train_step + 1) % grad_accum_steps == 0 or cur_train_step == total_train_steps
     if update_grads:
-        with model.no_sync(): # no sync grads for efficiency
-            scaler.scale(ret_dict.loss_metrics.loss / grad_accum_steps).backward()
-    else:
         scaler.scale(ret_dict.loss_metrics.loss / grad_accum_steps).backward()
+    else:
+        with model.no_sync():
+            scaler.scale(ret_dict.loss_metrics.loss / grad_accum_steps).backward()
     cur_train_step += 1
 
     if update_grads:

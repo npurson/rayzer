@@ -94,5 +94,3 @@ inference:
     num_frames: 30
     loop_video: True 
     order_poses: False
-
-  

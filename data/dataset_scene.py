@@ -1,7 +1,6 @@
 # Copyright (c) 2025 Haian Jin and Hanwen Jiang. Created for the LVSM project (ICLR 2025) and RayZer (ICCV 2025).
 
 import random
-import traceback
 import os
 import numpy as np
 import PIL
@@ -69,7 +68,7 @@ class Dataset(Dataset):
 
 
     def preprocess_frames(self, frames_chosen, image_paths_chosen):
-        resize_h = self.config.model.image_tokenizer.image_size
+        target_size = self.config.model.image_tokenizer.image_size
         patch_size = self.config.model.image_tokenizer.patch_size
         square_crop = self.config.training.get("square_crop", False)
 
@@ -78,18 +77,30 @@ class Dataset(Dataset):
         for cur_frame, cur_image_path in zip(frames_chosen, image_paths_chosen):
             image = PIL.Image.open(cur_image_path)
             original_image_w, original_image_h = image.size
-            
-            resize_w = int(resize_h / original_image_h * original_image_w)
-            resize_w = int(round(resize_w / patch_size) * patch_size)
-            # if torch.distributed.get_rank() == 0:
-            #     import ipdb; ipdb.set_trace()
+
+            if square_crop:
+                # 确保短边 >= target_size，长边按比例缩放，然后中心裁剪到 target_size x target_size
+                if original_image_w >= original_image_h:
+                    # 横向图：以高度为基准
+                    resize_h = target_size
+                    resize_w = int(target_size / original_image_h * original_image_w)
+                    resize_w = int(round(resize_w / patch_size) * patch_size)
+                else:
+                    # 纵向图：以宽度为基准，确保宽度 >= target_size
+                    resize_w = int(round(target_size / patch_size) * patch_size)
+                    resize_h = int(resize_w / original_image_w * original_image_h)
+                    resize_h = int(round(resize_h / patch_size) * patch_size)
+            else:
+                resize_h = target_size
+                resize_w = int(target_size / original_image_h * original_image_w)
+                resize_w = int(round(resize_w / patch_size) * patch_size)
 
             image = image.resize((resize_w, resize_h), resample=PIL.Image.LANCZOS)
             if square_crop:
-                min_size = min(resize_h, resize_w)
-                start_h = (resize_h - min_size) // 2
-                start_w = (resize_w - min_size) // 2
-                image = image.crop((start_w, start_h, start_w + min_size, start_h + min_size))
+                crop_size = target_size
+                start_h = (resize_h - crop_size) // 2
+                start_w = (resize_w - crop_size) // 2
+                image = image.crop((start_w, start_h, start_w + crop_size, start_h + crop_size))
 
             image = np.array(image) / 255.0
             image = torch.from_numpy(image).permute(2, 0, 1).float()
@@ -180,7 +191,17 @@ class Dataset(Dataset):
 
 
     def __getitem__(self, idx):
-        # try:
+        max_retries = 10
+        for retry in range(max_retries):
+            try:
+                return self._load_scene(idx)
+            except Exception as e:
+                scene_path = self.all_scene_paths[idx].strip() if idx < len(self.all_scene_paths) else "unknown"
+                print(f"[Dataset] Error loading scene {scene_path}: {e}. Retrying with another scene ({retry+1}/{max_retries})...")
+                idx = random.randint(0, len(self) - 1)
+        raise RuntimeError(f"[Dataset] Failed to load any scene after {max_retries} retries")
+
+    def _load_scene(self, idx):
         scene_path = self.all_scene_paths[idx].strip()
         scene_root = scene_path.replace('opencv_cameras.json', '')
         data_json = json.load(open(scene_path, 'r'))

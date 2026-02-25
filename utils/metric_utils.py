@@ -14,6 +14,8 @@ from easydict import EasyDict as edict
 import json
 from rich import print
 
+from utils.camera_eval import evaluate_camera_pose_metrics
+
 import warnings
 # Suppress warnings for LPIPS loss loading
 warnings.filterwarnings("ignore", category=UserWarning, message="The parameter 'pretrained' is deprecated since 0.13")
@@ -155,6 +157,15 @@ def export_results(
                 sample_dir,
                 scene_name
             )
+
+            # Compute and save pose metrics if GT c2w is available
+            if hasattr(result, 'gt_c2w') and result.gt_c2w is not None and hasattr(result, 'c2w'):
+                _save_pose_metrics(
+                    result.gt_c2w[batch_idx],   # [v_all, 4, 4]
+                    result.c2w[batch_idx],       # [v_all, 4, 4]
+                    sample_dir,
+                    scene_name
+                )
         
         # Save video if available
         if hasattr(result, "video_rendering"):
@@ -260,6 +271,30 @@ def _save_metrics(target, prediction, view_indices, out_dir, scene_name):
         json.dump(metrics, f, indent=2)
 
 
+def _save_pose_metrics(gt_c2w, pred_c2w, out_dir, scene_name):
+    """
+    Evaluate and save camera pose metrics.
+    
+    Args:
+        gt_c2w: [V, 4, 4] ground truth c2w matrices
+        pred_c2w: [V, 4, 4] predicted c2w matrices
+        out_dir: directory to save metrics
+        scene_name: scene identifier
+    """
+    gt_c2w = gt_c2w.to(torch.float32)
+    pred_c2w = pred_c2w.to(torch.float32)
+    
+    pose_metrics = evaluate_camera_pose_metrics(gt_c2w, pred_c2w, thresholds=[5, 15, 30])
+    
+    result = {
+        "scene_name": scene_name,
+        **{k: float(v) for k, v in pose_metrics.items()}
+    }
+    
+    with open(os.path.join(out_dir, "pose_metrics.json"), "w") as f:
+        json.dump(result, f, indent=2)
+
+
 def _save_video(frames, output_path):
     """
     Save video from rendered frames.
@@ -270,6 +305,15 @@ def _save_video(frames, output_path):
     
     frames = np.ascontiguousarray(np.array(frames.to(torch.float32).detach().cpu()))
     frames = rearrange(frames, "v c h w -> v h w c")
+    
+    # Handle NaN and Inf values (can occur early in training)
+    if not np.isfinite(frames).all():
+        print(f"Warning: Video frames contain NaN/Inf values, replacing with 0")
+        frames = np.nan_to_num(frames, nan=0.0, posinf=1.0, neginf=0.0)
+    
+    # Clip to valid range
+    frames = np.clip(frames, 0.0, 1.0)
+    
     data_utils.create_video_from_frames(
         frames, 
         output_path, 
@@ -289,9 +333,12 @@ def summarize_evaluation(evaluation_folder):
     )
 
     metrics = {}
+    pose_metrics = {}
     valid_subfolders = []
+    pose_valid_subfolders = []
     
     for subfolder in subfolders:
+        # Rendering metrics
         json_path = os.path.join(subfolder, "metrics.json")
         if not os.path.exists(json_path):
             print(f"!!! Metrics file not found in {subfolder}, skipping...")
@@ -302,7 +349,6 @@ def summarize_evaluation(evaluation_folder):
         with open(json_path, "r") as f:
             try:
                 data = json.load(f)
-                # Extract summary metrics
                 for metric_name, metric_value in data["summary"].items():
                     if metric_name == "scene_name":
                         continue
@@ -310,10 +356,25 @@ def summarize_evaluation(evaluation_folder):
             except (json.JSONDecodeError, KeyError) as e:
                 print(f"Error reading metrics from {json_path}: {e}")
 
+        # Pose metrics
+        pose_json_path = os.path.join(subfolder, "pose_metrics.json")
+        if os.path.exists(pose_json_path):
+            pose_valid_subfolders.append(subfolder)
+            with open(pose_json_path, "r") as f:
+                try:
+                    pose_data = json.load(f)
+                    for metric_name, metric_value in pose_data.items():
+                        if metric_name == "scene_name":
+                            continue
+                        pose_metrics.setdefault(metric_name, []).append(metric_value)
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"Error reading pose metrics from {pose_json_path}: {e}")
+
     if not valid_subfolders:
         print(f"No valid metrics files found in {evaluation_folder}")
         return
 
+    # === Rendering metrics summary ===
     csv_file = os.path.join(evaluation_folder, "summary.csv")
     with open(csv_file, "w") as f:
         header = ["Index"] + list(metrics.keys())
@@ -329,9 +390,36 @@ def summarize_evaluation(evaluation_folder):
         averages = [str(sum(values) / len(values)) for values in metrics.values()]
         f.write(f"average,{','.join(averages)}\n")
     
-    print(f"Summary written to {csv_file}")
-    print(f"Average: {','.join(averages)}")
+    print(f"[Rendering] Summary written to {csv_file}")
+    print(f"[Rendering] Average: {','.join(averages)}")
 
-    # export average metrics to a text file
+    # === Pose metrics summary ===
+    if pose_metrics:
+        pose_csv_file = os.path.join(evaluation_folder, "pose_summary.csv")
+        with open(pose_csv_file, "w") as f:
+            header = ["Index"] + list(pose_metrics.keys())
+            f.write(",".join(header) + "\n")
+            
+            for i, subfolder in enumerate(pose_valid_subfolders):
+                basename = os.path.basename(subfolder)
+                values = [str(metric_values[i]) for metric_values in pose_metrics.values()]
+                f.write(f"{basename},{','.join(values)}\n")
+            
+            f.write("\n")
+            
+            pose_averages = [str(sum(values) / len(values)) for values in pose_metrics.values()]
+            f.write(f"average,{','.join(pose_averages)}\n")
+        
+        print(f"[Pose] Summary written to {pose_csv_file}")
+        pose_avg_str = ", ".join(f"{k}: {sum(v)/len(v):.4f}" for k, v in pose_metrics.items())
+        print(f"[Pose] Average: {pose_avg_str}")
+
+    # Export combined average metrics
     with open(os.path.join(evaluation_folder, "average_metrics.txt"), "w") as f:
-        f.write(f"Average: {','.join(averages)}\n")
+        render_header = list(metrics.keys())
+        f.write(f"[Rendering] {', '.join(render_header)}\n")
+        f.write(f"[Rendering] Average: {', '.join(averages)}\n")
+        if pose_metrics:
+            pose_header = list(pose_metrics.keys())
+            f.write(f"\n[Pose] {', '.join(pose_header)}\n")
+            f.write(f"[Pose] Average: {', '.join(pose_averages)}\n")

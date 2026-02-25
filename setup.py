@@ -216,23 +216,34 @@ def local_backup_src_code(
 
 
 def init_wandb_and_backup(config):
-    # API key validation
-    assert os.path.exists(
-        config.training.api_key_path
-    ), f"API key file does not exist: {config.training.api_key_path}"
-    api_keys = edict(yaml.safe_load(open(config.training.api_key_path, "r")))
-    assert api_keys.wandb is not None, "Wandb API key not found in api key file"
+    # WandB mode: "online" (default), "offline" (save locally), "disabled" (no wandb)
+    wandb_mode = config.training.get("wandb_mode", "online")
+    
+    if wandb_mode == "disabled":
+        os.environ["WANDB_MODE"] = "disabled"
+        print("[WandB] Disabled - no logging")
+        wandb.init(mode="disabled")
+    else:
+        if wandb_mode == "offline":
+            os.environ["WANDB_MODE"] = "offline"
+            print("[WandB] Offline mode - logs saved locally in ./wandb/")
+        else:
+            # Online mode - need API key
+            assert os.path.exists(
+                config.training.api_key_path
+            ), f"API key file does not exist: {config.training.api_key_path}"
+            api_keys = edict(yaml.safe_load(open(config.training.api_key_path, "r")))
+            assert api_keys.wandb is not None, "Wandb API key not found in api key file"
+            os.environ["WANDB_API_KEY"] = api_keys.wandb
 
-    # WandB setup and login
-    os.environ["WANDB_API_KEY"] = api_keys.wandb
-
-    # WandB initialization
-    config_copy = copy.deepcopy(config)
-    wandb.init(
-        project=config.training.wandb_project,
-        name=config.training.wandb_exp_name,
-        config=config_copy,
-    )
+        # WandB initialization
+        config_copy = copy.deepcopy(config)
+        wandb.init(
+            project=config.training.wandb_project,
+            name=config.training.wandb_exp_name,
+            config=config_copy,
+            mode=wandb_mode,
+        )
 
     # Source code backup
     cur_dir = os.path.dirname(os.path.realpath(__file__))

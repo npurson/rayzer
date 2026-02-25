@@ -100,6 +100,9 @@ with torch.no_grad(), torch.autocast(
             result= model.module.render_video(result, **config.inference.render_video_config)
         elif 'rayzer' in config.model.class_name:
             result = model(batch, create_visual=True, render_video=config.inference.get("render_video", False))
+        # Attach GT c2w from batch for pose evaluation
+        if 'c2w' in batch:
+            result.gt_c2w = batch['c2w']  # [b, v_all, 4, 4]
         export_results(result, inference_out_dir, compute_metrics=config.inference.get("compute_metrics"))
     torch.cuda.empty_cache()
 
