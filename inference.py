@@ -23,10 +23,10 @@ dist.barrier()
 torch.backends.cuda.matmul.allow_tf32 = config.training.use_tf32
 torch.backends.cudnn.allow_tf32 = config.training.use_tf32
 amp_dtype_mapping = {
-    "fp16": torch.float16, 
-    "bf16": torch.bfloat16, 
-    "fp32": torch.float32, 
-    'tf32': torch.float32
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+    "tf32": torch.float32,
 }
 
 
@@ -46,12 +46,11 @@ dataloader = DataLoader(
     persistent_workers=True,
     pin_memory=False,
     drop_last=True,
-    sampler=datasampler
+    sampler=datasampler,
 )
 dataloader_iter = iter(dataloader)
 
 dist.barrier()
-
 
 
 # Import model and load checkpoint
@@ -61,26 +60,43 @@ model = LVSM(config).to(ddp_info.device)
 model = DDP(model, device_ids=[ddp_info.local_rank])
 
 
-if config.inference.get("model_path", None) is not None and config.inference.get("if_inference", False):
+if config.inference.get("model_path", None) is not None and config.inference.get(
+    "if_inference", False
+):
     # use the specified checkpoint if specified
-    checkpoint = torch.load(config.inference.model_path, map_location="cpu", weights_only=True)
-    model.module.load_state_dict(checkpoint["model"], strict=False) # strict=False because the loss computer is different from internal version, BE CAREFUL!
-elif config.inference.get("model_path", None) is None and config.inference.get("if_inference", False):
+    checkpoint = torch.load(
+        config.inference.model_path, map_location="cpu", weights_only=True
+    )
+    model.module.load_state_dict(
+        checkpoint["model"], strict=False
+    )  # strict=False because the loss computer is different from internal version, BE CAREFUL!
+elif config.inference.get("model_path", None) is None and config.inference.get(
+    "if_inference", False
+):
     # otherwise, use the last training checkpoint
     model.module.load_ckpt(config.training.checkpoint_dir)
 
-inference_sampling = config.inference.view_idx_file_path.replace('.json', '').split('_')[-1]
+inference_sampling = config.inference.view_idx_file_path.replace(".json", "").split(
+    "_"
+)[-1]
 inference_out_dir = os.path.join(
-    config.get("inference_out_root", None), config.training.wandb_exp_name + '_' + config.training.view_selector.type + '_' + inference_sampling
+    config.get("inference_out_root", None),
+    config.training.wandb_exp_name
+    + "_"
+    + config.training.view_selector.type
+    + "_"
+    + inference_sampling,
 )
-if ddp_info.is_main_process:  
+if ddp_info.is_main_process:
     print(f"Running inference; save results to: {inference_out_dir}")
     os.makedirs(inference_out_dir, exist_ok=True)
     # avoid multiple processes downloading LPIPS at the same time
     import lpips
+
     # Suppress the warning by setting weights_only=True
     import warnings
-    warnings.filterwarnings('ignore', category=FutureWarning)
+
+    warnings.filterwarnings("ignore", category=FutureWarning)
 
 dist.barrier()
 
@@ -94,16 +110,29 @@ with torch.no_grad(), torch.autocast(
     dtype=amp_dtype_mapping[config.training.amp_dtype],
 ):
     for batch in dataloader:
-        batch = {k: v.to(ddp_info.device) if type(v) == torch.Tensor else v for k, v in batch.items()}
-        if 'LVSM' in config.model.class_name:
+        batch = {
+            k: v.to(ddp_info.device) if type(v) == torch.Tensor else v
+            for k, v in batch.items()
+        }
+        if "LVSM" in config.model.class_name:
             result = model(batch)
-            result= model.module.render_video(result, **config.inference.render_video_config)
-        elif 'rayzer' in config.model.class_name:
-            result = model(batch, create_visual=True, render_video=config.inference.get("render_video", False))
+            result = model.module.render_video(
+                result, **config.inference.render_video_config
+            )
+        elif "rayzer" in config.model.class_name:
+            result = model(
+                batch,
+                create_visual=True,
+                render_video=config.inference.get("render_video", False),
+            )
         # Attach GT c2w from batch for pose evaluation
-        if 'c2w' in batch:
-            result.gt_c2w = batch['c2w']  # [b, v_all, 4, 4]
-        export_results(result, inference_out_dir, compute_metrics=config.inference.get("compute_metrics"))
+        if "c2w" in batch:
+            result.gt_c2w = batch["c2w"]  # [b, v_all, 4, 4]
+        export_results(
+            result,
+            inference_out_dir,
+            compute_metrics=config.inference.get("compute_metrics"),
+        )
     torch.cuda.empty_cache()
 
 

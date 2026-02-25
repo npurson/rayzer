@@ -9,52 +9,59 @@ from pathlib import Path
 
 PAGE_SIZE = 200
 
+
 def generate_html(result_folder, output_file="result_visualization.html"):
     """
     Generate paginated HTML files to visualize results from the given folder structure.
-    
+
     Each page shows up to 200 samples and includes navigation for previous/next pages,
     a page selector, and page count information.
     An index page is also created which contains links to all generated pages.
-    
+
     Args:
         result_folder (str): Path to the result folder
         output_file (str): Base name for the output HTML file
     """
     # Convert to absolute path for processing
     result_folder = os.path.abspath(result_folder)
-    
+
     # Get all sample directories (they are named with numbers)
     sample_dirs = [d for d in os.listdir(result_folder) if d.isdigit()]
     sample_dirs.sort(key=lambda x: int(x))  # Sort numerically
-    
+
     # Load summary.csv data if available
     summary_data = {}
     summary_file = os.path.join(result_folder, "summary.csv")
     if os.path.exists(summary_file):
-        with open(summary_file, 'r') as f:
+        with open(summary_file, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if 'sample_id' in row:
-                    sample_id = row['sample_id']
+                if "sample_id" in row:
+                    sample_id = row["sample_id"]
                     summary_data[sample_id] = row
 
     # Determine number of pages needed
     total_samples = len(sample_dirs)
     num_pages = max(1, math.ceil(total_samples / PAGE_SIZE))
-    
+
     # Determine base name and extension for output file(s)
     base_name, ext = os.path.splitext(output_file)
-    
+
     # Function to generate navigation HTML given the current page (1-indexed)
     def get_nav_html(current_page):
         # Determine filenames for previous and next pages (if applicable)
         if num_pages == 1:
             prev_link = next_link = ""
         else:
-            prev_link = f"{base_name}_page_{current_page-1}{ext}" if current_page > 1 else ""
-            next_link = f"{base_name}_page_{current_page+1}{ext}" if current_page < num_pages else ""
-        
+            prev_link = (
+                f"{base_name}_page_{current_page-1}{ext}" if current_page > 1 else ""
+            )
+            next_link = (
+                f"{base_name}_page_{current_page+1}{ext}"
+                if current_page < num_pages
+                else ""
+            )
+
         nav = f"""
             <div class="pagination">
                 <button onclick="window.location.href='{prev_link}'" {'disabled' if current_page == 1 else ''}>Previous Page</button>
@@ -70,7 +77,7 @@ def generate_html(result_folder, output_file="result_visualization.html"):
     def build_html(page_samples, current_page):
         # Navigation bar (top and bottom)
         nav_html = get_nav_html(current_page)
-        
+
         html = f"""
         <!DOCTYPE html>
         <html lang="en">
@@ -417,98 +424,145 @@ def generate_html(result_folder, output_file="result_visualization.html"):
             comparison_img_rel = os.path.join(sample_dir, "gt_vs_pred.png")
             video_rel = os.path.join(sample_dir, "rendered_video.mp4")
             metrics_path = os.path.join(sample_path, "metrics.json")
-            
+
             # Read metrics if available
             metrics_html = "<div class='no-metrics'>No metrics available</div>"
             if os.path.exists(metrics_path):
                 try:
-                    with open(metrics_path, 'r') as f:
+                    with open(metrics_path, "r") as f:
                         metrics_data = json.load(f)
-                        
+
                         metrics_html = "<div class='metrics-container'>"
                         # Summary section
                         if "summary" in metrics_data:
                             metrics_html += "<div class='metrics-summary'>"
                             metrics_html += "<h3>Summary Metrics</h3>"
                             metrics_html += "<div class='metrics-cards'>"
-                            
+
                             summary = metrics_data["summary"]
                             for metric, value in summary.items():
-                                formatted_value = f"{value:.4f}" if isinstance(value, (int, float)) else value
-                                metrics_html += f"<div class='metric-card summary-card'>"
-                                metrics_html += f"<div class='metric-name'>{metric.upper()}</div>"
-                                metrics_html += f"<div class='metric-value'>{formatted_value}</div>"
+                                formatted_value = (
+                                    f"{value:.4f}"
+                                    if isinstance(value, (int, float))
+                                    else value
+                                )
+                                metrics_html += (
+                                    f"<div class='metric-card summary-card'>"
+                                )
+                                metrics_html += (
+                                    f"<div class='metric-name'>{metric.upper()}</div>"
+                                )
+                                metrics_html += (
+                                    f"<div class='metric-value'>{formatted_value}</div>"
+                                )
                                 metrics_html += "</div>"
-                            
+
                             metrics_html += "</div></div>"
-                        
+
                         # Per-view section
                         if "per_view" in metrics_data and metrics_data["per_view"]:
                             metrics_html += "<div class='metrics-per-view'>"
                             metrics_html += "<button type='button' class='collapsible'>"
-                            metrics_html += "<h3 style='margin: 0;'>Per-View Metrics</h3>"
+                            metrics_html += (
+                                "<h3 style='margin: 0;'>Per-View Metrics</h3>"
+                            )
                             metrics_html += "</button>"
                             metrics_html += "<div class='collapsible-content'>"
                             metrics_html += "<table class='per-view-table'>"
-                            
+
                             # Collect all values for color coding
                             all_psnr_values = []
                             all_lpips_values = []
                             all_ssim_values = []
                             for view_data in metrics_data["per_view"]:
-                                psnr = view_data.get('psnr', None)
-                                lpips = view_data.get('lpips', None)
-                                ssim = view_data.get('ssim', None)
+                                psnr = view_data.get("psnr", None)
+                                lpips = view_data.get("lpips", None)
+                                ssim = view_data.get("ssim", None)
                                 if psnr is not None and isinstance(psnr, (int, float)):
                                     all_psnr_values.append(psnr)
-                                if lpips is not None and isinstance(lpips, (int, float)):
+                                if lpips is not None and isinstance(
+                                    lpips, (int, float)
+                                ):
                                     all_lpips_values.append(lpips)
                                 if ssim is not None and isinstance(ssim, (int, float)):
                                     all_ssim_values.append(ssim)
-                            
+
                             def get_color_class(value, all_values, metric_type):
                                 if value is None or not isinstance(value, (int, float)):
                                     return ""
-                                is_higher_better = metric_type != 'lpips'
+                                is_higher_better = metric_type != "lpips"
                                 if not all_values:
                                     return ""
-                                sorted_values = sorted(all_values, reverse=is_higher_better)
+                                sorted_values = sorted(
+                                    all_values, reverse=is_higher_better
+                                )
                                 if len(sorted_values) < 3:
-                                    return "high-good" if value == sorted_values[0] else "low-good"
+                                    return (
+                                        "high-good"
+                                        if value == sorted_values[0]
+                                        else "low-good"
+                                    )
                                 else:
                                     third = len(sorted_values) // 3
                                     if value in sorted_values[:third]:
                                         return "high-good"
-                                    elif value in sorted_values[third:2*third]:
+                                    elif value in sorted_values[third : 2 * third]:
                                         return "medium-good"
                                     else:
                                         return "low-good"
-                            
+
                             for view_data in metrics_data["per_view"]:
                                 view_id = view_data.get("view", "N/A")
-                                psnr = view_data.get('psnr', None)
-                                lpips = view_data.get('lpips', None)
-                                ssim = view_data.get('ssim', None)
-                                psnr_display = f"{psnr:.4f}" if psnr is not None and isinstance(psnr, (int, float)) else "N/A"
-                                lpips_display = f"{lpips:.4f}" if lpips is not None and isinstance(lpips, (int, float)) else "N/A"
-                                ssim_display = f"{ssim:.4f}" if ssim is not None and isinstance(ssim, (int, float)) else "N/A"
-                                psnr_class = get_color_class(psnr, all_psnr_values, 'psnr')
-                                lpips_class = get_color_class(lpips, all_lpips_values, 'lpips')
-                                ssim_class = get_color_class(ssim, all_ssim_values, 'ssim')
-                                
+                                psnr = view_data.get("psnr", None)
+                                lpips = view_data.get("lpips", None)
+                                ssim = view_data.get("ssim", None)
+                                psnr_display = (
+                                    f"{psnr:.4f}"
+                                    if psnr is not None
+                                    and isinstance(psnr, (int, float))
+                                    else "N/A"
+                                )
+                                lpips_display = (
+                                    f"{lpips:.4f}"
+                                    if lpips is not None
+                                    and isinstance(lpips, (int, float))
+                                    else "N/A"
+                                )
+                                ssim_display = (
+                                    f"{ssim:.4f}"
+                                    if ssim is not None
+                                    and isinstance(ssim, (int, float))
+                                    else "N/A"
+                                )
+                                psnr_class = get_color_class(
+                                    psnr, all_psnr_values, "psnr"
+                                )
+                                lpips_class = get_color_class(
+                                    lpips, all_lpips_values, "lpips"
+                                )
+                                ssim_class = get_color_class(
+                                    ssim, all_ssim_values, "ssim"
+                                )
+
                                 metrics_html += f"<tr>"
                                 metrics_html += f"<td>{view_id}</td>"
-                                metrics_html += f"<td class='{psnr_class}'>{psnr_display}</td>"
-                                metrics_html += f"<td class='{lpips_class}'>{lpips_display}</td>"
-                                metrics_html += f"<td class='{ssim_class}'>{ssim_display}</td>"
+                                metrics_html += (
+                                    f"<td class='{psnr_class}'>{psnr_display}</td>"
+                                )
+                                metrics_html += (
+                                    f"<td class='{lpips_class}'>{lpips_display}</td>"
+                                )
+                                metrics_html += (
+                                    f"<td class='{ssim_class}'>{ssim_display}</td>"
+                                )
                                 metrics_html += f"</tr>"
-                            
+
                             metrics_html += "</table></div></div>"
-                        
+
                         metrics_html += "</div>"
                 except Exception as e:
                     metrics_html = f"<div class='error-metrics'>Error reading metrics: {str(e)}</div>"
-            
+
             # Append HTML for the sample
             html += f"""
                         <div class="sample">
@@ -548,7 +602,7 @@ def generate_html(result_folder, output_file="result_visualization.html"):
         # Add summary view (if summary.csv exists)
         if os.path.exists(summary_file):
             try:
-                with open(summary_file, 'r') as f:
+                with open(summary_file, "r") as f:
                     reader = csv.reader(f)
                     headers = next(reader)
                 html += """
@@ -559,7 +613,7 @@ def generate_html(result_folder, output_file="result_visualization.html"):
                 for header in headers:
                     html += f"<th>{header}</th>"
                 html += "</tr>"
-                with open(summary_file, 'r') as f:
+                with open(summary_file, "r") as f:
                     reader = csv.DictReader(f)
                     for row in reader:
                         html += "<tr>"
@@ -571,7 +625,7 @@ def generate_html(result_folder, output_file="result_visualization.html"):
                 html += f"<p>Error rendering summary: {str(e)}</p>"
         else:
             html += "<p>No summary.csv file found</p>"
-            
+
         html += """
                     </div>
                 </div>
@@ -665,7 +719,7 @@ def generate_html(result_folder, output_file="result_visualization.html"):
         end_index = start_index + PAGE_SIZE
         page_samples = sample_dirs[start_index:end_index]
         current_page = page + 1
-        
+
         html_content = build_html(page_samples, current_page)
         # Determine output filename
         if num_pages == 1:
@@ -675,12 +729,12 @@ def generate_html(result_folder, output_file="result_visualization.html"):
             output_filename = f"{base_name}_page_{current_page}{ext}"
             output_path = os.path.join(result_folder, output_filename)
             output_files.append(output_filename)
-        
-        with open(output_path, 'w') as f:
+
+        with open(output_path, "w") as f:
             f.write(html_content)
-        
+
         print(f"HTML visualization created: {output_path}")
-    
+
     # Generate an index page that lists links to all generated pages
     index_html = """
     <!DOCTYPE html>
@@ -728,27 +782,35 @@ def generate_html(result_folder, output_file="result_visualization.html"):
     # Use the list of output files to generate links
     for i, file_name in enumerate(output_files, start=1):
         index_html += f'<li><a href="{file_name}">Page {i} of {num_pages}</a></li>\n'
-    
+
     index_html += """
            </ul>
        </div>
     </body>
     </html>
     """
-    
+
     index_path = os.path.join(result_folder, "index.html")
-    with open(index_path, 'w') as f:
+    with open(index_path, "w") as f:
         f.write(index_html)
-    
+
     print(f"Index page created: {index_path}")
-    print("All paginated HTML files and the index page have been created. You can open the index page in a web browser to view your results.")
+    print(
+        "All paginated HTML files and the index page have been created. You can open the index page in a web browser to view your results."
+    )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate paginated HTML visualization for result folder")
+    parser = argparse.ArgumentParser(
+        description="Generate paginated HTML visualization for result folder"
+    )
     parser.add_argument("result_folder", help="Path to the result folder")
-    parser.add_argument("--output", "-o", default="result_visualization.html", 
-                        help="Output HTML file name (default: result_visualization.html)")
-    
+    parser.add_argument(
+        "--output",
+        "-o",
+        default="result_visualization.html",
+        help="Output HTML file name (default: result_visualization.html)",
+    )
+
     args = parser.parse_args()
     generate_html(args.result_folder, args.output)

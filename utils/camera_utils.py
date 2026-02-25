@@ -103,7 +103,11 @@ def quaternion_from_matrix(matrix: NDArray, isprecise: bool = False) -> np.ndarr
 
 
 def quaternion_slerp(
-    quat0: NDArray, quat1: NDArray, fraction: float, spin: int = 0, shortestpath: bool = True
+    quat0: NDArray,
+    quat1: NDArray,
+    fraction: float,
+    spin: int = 0,
+    shortestpath: bool = True,
 ) -> np.ndarray:
     """Return spherical linear interpolation between two quaternions.
     Args:
@@ -160,7 +164,9 @@ def quaternion_matrix(quaternion: NDArray) -> np.ndarray:
     )
 
 
-def get_interpolated_poses(pose_a: NDArray, pose_b: NDArray, steps: int = 10) -> List[float]:
+def get_interpolated_poses(
+    pose_a: NDArray, pose_b: NDArray, steps: int = 10
+) -> List[float]:
     """Return interpolation of poses with specified number of steps.
     Args:
         pose_a: first pose
@@ -234,7 +240,9 @@ def get_ordered_poses_and_k(
     for _ in range(poses_num - 1):
         distances = torch.norm(ordered_poses[-1][:, 3] - poses[:, :, 3], dim=1)
         idx = torch.argmin(distances)
-        ordered_poses = torch.cat((ordered_poses, torch.unsqueeze(poses[idx], 0)), dim=0)
+        ordered_poses = torch.cat(
+            (ordered_poses, torch.unsqueeze(poses[idx], 0)), dim=0
+        )
         ordered_ks = torch.cat((ordered_ks, torch.unsqueeze(Ks[idx], 0)), dim=0)
         poses = torch.cat((poses[0:idx], poses[idx + 1 :]), dim=0)
         Ks = torch.cat((Ks[0:idx], Ks[idx + 1 :]), dim=0)
@@ -284,7 +292,7 @@ def normalize(x: torch.Tensor) -> Float[Tensor, "*batch"]:
 
 
 def viewmatrix(z, up, pos):
-    """ Construct a camera view matrix using the look direction, up vector, and position. """
+    """Construct a camera view matrix using the look direction, up vector, and position."""
     vec2 = normalize(up)
     vec0 = normalize(torch.cross(z, vec2))
     vec1 = normalize(torch.cross(vec0, z))
@@ -324,18 +332,20 @@ def viewmatrix(z, up, pos):
 #             [0, 0, 1, t],  # Forward movement
 #             [0, 0, 0, 1]
 #         ])
-        
+
 #         # Multiply the camera-to-world matrix with the new forward translation
 #         new_pose = np.matmul(c2w.cpu().numpy(), forward_translation)
 #         poses.append(torch.tensor(new_pose))
 #         Ks_list.append(Ks)
 #     return torch.stack(poses), torch.stack(Ks_list)
-    
+
+
 def normalize_np(x):
     return x / np.linalg.norm(x)
 
+
 def get_forward_facing_trajectory(c2w, Ks, N, N_rots=2, zrate=0.25, focal=2.5):
-    '''
+    """
     Args:
         c2w: 4x4 tensor of camera-to-world matrices, in OpenCV format
         Ks: 3x3 tensor of camera intrinsics,
@@ -351,24 +361,35 @@ def get_forward_facing_trajectory(c2w, Ks, N, N_rots=2, zrate=0.25, focal=2.5):
         generate a new trajectory of N poses facing forward
         move forward along the z-axis in the camera coordinate system, and spiral around the central object
 
-    '''
+    """
 
     poses = []
     # Ks = Ks.cpu().numpy()  # Convert intrinsics to numpy for easier manipulation
     Ks_list = []
-    rads = np.array([0.1, 0.1, 1.2, 1.])
-    rads = np.array([0.12, 0.2, 0.7, 1.])
+    rads = np.array([0.1, 0.1, 1.2, 1.0])
+    rads = np.array([0.12, 0.2, 0.7, 1.0])
     c2w = c2w.cpu().numpy()
-    for theta in np.linspace(0., 2. * np.pi * N_rots, N+1)[:-1]:
+    for theta in np.linspace(0.0, 2.0 * np.pi * N_rots, N + 1)[:-1]:
         # c = np.dot(c2w[:3,:4], np.array([np.cos(theta), -np.sin(theta), np.sin(0.5*np.pi*theta/(2. * np.pi * N_rots)), 1.]) * rads)
-        c = np.dot(c2w[:3,:4], np.array([np.cos(theta), -np.sin(theta), (0.2 + theta/(2. * np.pi * N_rots)), 1.]) * rads)
+        c = np.dot(
+            c2w[:3, :4],
+            np.array(
+                [
+                    np.cos(theta),
+                    -np.sin(theta),
+                    (0.2 + theta / (2.0 * np.pi * N_rots)),
+                    1.0,
+                ]
+            )
+            * rads,
+        )
 
-        new_z = normalize_np(np.dot(c2w[:3,:4], np.array([0,0, focal, 1.])) - c)
-        new_x = normalize_np(np.cross(np.array([0,1,0]), new_z))
+        new_z = normalize_np(np.dot(c2w[:3, :4], np.array([0, 0, focal, 1.0])) - c)
+        new_x = normalize_np(np.cross(np.array([0, 1, 0]), new_z))
         new_y = normalize_np(np.cross(new_z, new_x))
         new_c2w = np.eye(4)
-        new_c2w[:3,:3] = np.stack([new_x, new_y, new_z], 1)
-        new_c2w[:3,3] = c
+        new_c2w[:3, :3] = np.stack([new_x, new_y, new_z], 1)
+        new_c2w[:3, 3] = c
         poses.append(torch.tensor(new_c2w))
         Ks_list.append(Ks)
     # for i in range(N):
@@ -382,13 +403,12 @@ def get_forward_facing_trajectory(c2w, Ks, N, N_rots=2, zrate=0.25, focal=2.5):
     #         [0, 0, 1, t],  # Forward movement
     #         [0, 0, 0, 1]
     #     ])
-        
+
     #     # Multiply the camera-to-world matrix with the new forward translation
     #     new_pose = np.matmul(c2w.cpu().numpy(), forward_translation)
     #     poses.append(torch.tensor(new_pose))
     #     Ks_list.append(Ks)
     return torch.stack(poses), torch.stack(Ks_list)
-    
 
 
 def normalize_with_norm(x: torch.Tensor, dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -402,11 +422,15 @@ def normalize_with_norm(x: torch.Tensor, dim: int) -> Tuple[torch.Tensor, torch.
         Tuple of normalized tensor and corresponding norm.
     """
 
-    norm = torch.maximum(torch.linalg.vector_norm(x, dim=dim, keepdims=True), torch.tensor([_EPS]).to(x))
+    norm = torch.maximum(
+        torch.linalg.vector_norm(x, dim=dim, keepdims=True), torch.tensor([_EPS]).to(x)
+    )
     return x / norm, norm
 
 
-def viewmatrix(lookat: torch.Tensor, up: torch.Tensor, pos: torch.Tensor) -> Float[Tensor, "*batch"]:
+def viewmatrix(
+    lookat: torch.Tensor, up: torch.Tensor, pos: torch.Tensor
+) -> Float[Tensor, "*batch"]:
     """Returns a camera transformation matrix.
 
     Args:
@@ -454,7 +478,9 @@ def _compute_residual_and_jacobian(
     xd: torch.Tensor,
     yd: torch.Tensor,
     distortion_params: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     """Auxiliary function of radial_and_tangential_undistort() that computes residuals and jacobians.
     Adapted from MultiNeRF:
     https://github.com/google-research/multinerf/blob/b02228160d3179300c7d499dca28cb9ca3677f32/internal/camera_utils.py#L427-L474
@@ -540,13 +566,25 @@ def radial_and_tangential_undistort(
 
     for _ in range(max_iterations):
         fx, fy, fx_x, fx_y, fy_x, fy_y = _compute_residual_and_jacobian(
-            x=x, y=y, xd=coords[..., 0], yd=coords[..., 1], distortion_params=distortion_params
+            x=x,
+            y=y,
+            xd=coords[..., 0],
+            yd=coords[..., 1],
+            distortion_params=distortion_params,
         )
         denominator = fy_x * fx_y - fx_x * fy_y
         x_numerator = fx * fy_y - fy * fx_y
         y_numerator = fy * fx_x - fx * fy_x
-        step_x = torch.where(torch.abs(denominator) > eps, x_numerator / denominator, torch.zeros_like(denominator))
-        step_y = torch.where(torch.abs(denominator) > eps, y_numerator / denominator, torch.zeros_like(denominator))
+        step_x = torch.where(
+            torch.abs(denominator) > eps,
+            x_numerator / denominator,
+            torch.zeros_like(denominator),
+        )
+        step_y = torch.where(
+            torch.abs(denominator) > eps,
+            y_numerator / denominator,
+            torch.zeros_like(denominator),
+        )
 
         x = x + step_x
         y = y + step_y
@@ -554,7 +592,9 @@ def radial_and_tangential_undistort(
     return torch.stack([x, y], dim=-1)
 
 
-def rotation_matrix(a: Float[Tensor, "3"], b: Float[Tensor, "3"]) -> Float[Tensor, "3 3"]:
+def rotation_matrix(
+    a: Float[Tensor, "3"], b: Float[Tensor, "3"]
+) -> Float[Tensor, "3 3"]:
     """Compute the rotation matrix that rotates vector a to vector b.
 
     Args:
@@ -579,10 +619,16 @@ def rotation_matrix(a: Float[Tensor, "3"], b: Float[Tensor, "3"]) -> Float[Tenso
             [-v[1], v[0], 0],
         ]
     )
-    return torch.eye(3) + skew_sym_mat + skew_sym_mat @ skew_sym_mat * ((1 - c) / (s**2 + 1e-8))
+    return (
+        torch.eye(3)
+        + skew_sym_mat
+        + skew_sym_mat @ skew_sym_mat * ((1 - c) / (s**2 + 1e-8))
+    )
 
 
-def focus_of_attention(poses: Float[Tensor, "*num_poses 4 4"], initial_focus: Float[Tensor, "3"]) -> Float[Tensor, "3"]:
+def focus_of_attention(
+    poses: Float[Tensor, "*num_poses 4 4"], initial_focus: Float[Tensor, "3"]
+) -> Float[Tensor, "3"]:
     """Compute the focus of attention of a set of cameras. Only cameras
     that have the focus of attention in front of them are considered.
 
@@ -601,7 +647,13 @@ def focus_of_attention(poses: Float[Tensor, "*num_poses 4 4"], initial_focus: Fl
     # initial value for testing if the focus_pt is in front or behind
     focus_pt = initial_focus
     # Prune cameras which have the current have the focus_pt behind them.
-    active = torch.sum(active_directions.squeeze(-1) * (focus_pt - active_origins.squeeze(-1)), dim=-1) > 0
+    active = (
+        torch.sum(
+            active_directions.squeeze(-1) * (focus_pt - active_origins.squeeze(-1)),
+            dim=-1,
+        )
+        > 0
+    )
     done = False
     # We need at least two active cameras, else fallback on the previous solution.
     # This may be the "poses" solution if no cameras are active on first iteration, e.g.
@@ -610,10 +662,20 @@ def focus_of_attention(poses: Float[Tensor, "*num_poses 4 4"], initial_focus: Fl
         active_directions = active_directions[active]
         active_origins = active_origins[active]
         # https://en.wikipedia.org/wiki/Line–line_intersection#In_more_than_two_dimensions
-        m = torch.eye(3) - active_directions * torch.transpose(active_directions, -2, -1)
+        m = torch.eye(3) - active_directions * torch.transpose(
+            active_directions, -2, -1
+        )
         mt_m = torch.transpose(m, -2, -1) @ m
-        focus_pt = torch.linalg.inv(mt_m.mean(0)) @ (mt_m @ active_origins).mean(0)[:, 0]
-        active = torch.sum(active_directions.squeeze(-1) * (focus_pt - active_origins.squeeze(-1)), dim=-1) > 0
+        focus_pt = (
+            torch.linalg.inv(mt_m.mean(0)) @ (mt_m @ active_origins).mean(0)[:, 0]
+        )
+        active = (
+            torch.sum(
+                active_directions.squeeze(-1) * (focus_pt - active_origins.squeeze(-1)),
+                dim=-1,
+            )
+            > 0
+        )
         if active.all():
             # the set of active cameras did not change, so we're done.
             done = True
@@ -767,7 +829,9 @@ def fisheye624_project(xyz, params):
 
     assert xyz.ndim == 3
     assert params.ndim == 2
-    assert params.shape[-1] == 16 or params.shape[-1] == 15, "This model allows fx != fy"
+    assert (
+        params.shape[-1] == 16 or params.shape[-1] == 15
+    ), "This model allows fx != fy"
     eps = 1e-9
     B, N = xyz.shape[0], xyz.shape[1]
 
@@ -795,7 +859,9 @@ def fisheye624_project(xyz, params):
     rd_sq = xr_sq + yr_sq
     uv_dist_tu = uv_dist[:, :, 0] + ((2.0 * xr_sq + rd_sq) * p0 + 2.0 * xr * yr * p1)
     uv_dist_tv = uv_dist[:, :, 1] + ((2.0 * yr_sq + rd_sq) * p1 + 2.0 * xr * yr * p0)
-    uv_dist = torch.stack([uv_dist_tu, uv_dist_tv], dim=-1)  # Avoids in-place complaint.
+    uv_dist = torch.stack(
+        [uv_dist_tu, uv_dist_tv], dim=-1
+    )  # Avoids in-place complaint.
 
     # Thin Prism correction.
     s0 = params[:, -4].reshape(B, 1)
@@ -845,7 +911,9 @@ def fisheye624_unproject_helper(uv, params, max_iters: int = 5):
 
     assert uv.ndim == 3, "Expected batched input shaped BxNx3"
     assert params.ndim == 2
-    assert params.shape[-1] == 16 or params.shape[-1] == 15, "This model allows fx != fy"
+    assert (
+        params.shape[-1] == 16 or params.shape[-1] == 15
+    ), "This model allows fx != fy"
     eps = 1e-6
     B, N = uv.shape[0], uv.shape[1]
 
@@ -871,8 +939,12 @@ def fisheye624_unproject_helper(uv, params, max_iters: int = 5):
         xr_sq = xr_yr_sq[:, :, 0].reshape(B, N)
         yr_sq = xr_yr_sq[:, :, 1].reshape(B, N)
         rd_sq = xr_sq + yr_sq
-        uv_dist_est[:, :, 0] = uv_dist_est[:, :, 0] + ((2.0 * xr_sq + rd_sq) * p0 + 2.0 * xr * yr * p1)
-        uv_dist_est[:, :, 1] = uv_dist_est[:, :, 1] + ((2.0 * yr_sq + rd_sq) * p1 + 2.0 * xr * yr * p0)
+        uv_dist_est[:, :, 0] = uv_dist_est[:, :, 0] + (
+            (2.0 * xr_sq + rd_sq) * p0 + 2.0 * xr * yr * p1
+        )
+        uv_dist_est[:, :, 1] = uv_dist_est[:, :, 1] + (
+            (2.0 * yr_sq + rd_sq) * p1 + 2.0 * xr * yr * p0
+        )
         # Thin Prism terms.
         s0 = params[:, -4].reshape(B, 1)
         s1 = params[:, -3].reshape(B, 1)
@@ -883,18 +955,30 @@ def fisheye624_unproject_helper(uv, params, max_iters: int = 5):
         uv_dist_est[:, :, 1] = uv_dist_est[:, :, 1] + (s2 * rd_sq + s3 * rd_4)
         # Compute the derivative of uv_dist w.r.t. xr_yr.
         duv_dist_dxr_yr = uv.new_ones(B, N, 2, 2)
-        duv_dist_dxr_yr[:, :, 0, 0] = 1.0 + 6.0 * xr_yr[:, :, 0] * p0 + 2.0 * xr_yr[:, :, 1] * p1
+        duv_dist_dxr_yr[:, :, 0, 0] = (
+            1.0 + 6.0 * xr_yr[:, :, 0] * p0 + 2.0 * xr_yr[:, :, 1] * p1
+        )
         offdiag = 2.0 * (xr_yr[:, :, 0] * p1 + xr_yr[:, :, 1] * p0)
         duv_dist_dxr_yr[:, :, 0, 1] = offdiag
         duv_dist_dxr_yr[:, :, 1, 0] = offdiag
-        duv_dist_dxr_yr[:, :, 1, 1] = 1.0 + 6.0 * xr_yr[:, :, 1] * p1 + 2.0 * xr_yr[:, :, 0] * p0
+        duv_dist_dxr_yr[:, :, 1, 1] = (
+            1.0 + 6.0 * xr_yr[:, :, 1] * p1 + 2.0 * xr_yr[:, :, 0] * p0
+        )
         xr_yr_sq_norm = xr_yr_sq[:, :, 0] + xr_yr_sq[:, :, 1]
         temp1 = 2.0 * (s0 + 2.0 * s1 * xr_yr_sq_norm)
-        duv_dist_dxr_yr[:, :, 0, 0] = duv_dist_dxr_yr[:, :, 0, 0] + (xr_yr[:, :, 0] * temp1)
-        duv_dist_dxr_yr[:, :, 0, 1] = duv_dist_dxr_yr[:, :, 0, 1] + (xr_yr[:, :, 1] * temp1)
+        duv_dist_dxr_yr[:, :, 0, 0] = duv_dist_dxr_yr[:, :, 0, 0] + (
+            xr_yr[:, :, 0] * temp1
+        )
+        duv_dist_dxr_yr[:, :, 0, 1] = duv_dist_dxr_yr[:, :, 0, 1] + (
+            xr_yr[:, :, 1] * temp1
+        )
         temp2 = 2.0 * (s2 + 2.0 * s3 * xr_yr_sq_norm)
-        duv_dist_dxr_yr[:, :, 1, 0] = duv_dist_dxr_yr[:, :, 1, 0] + (xr_yr[:, :, 0] * temp2)
-        duv_dist_dxr_yr[:, :, 1, 1] = duv_dist_dxr_yr[:, :, 1, 1] + (xr_yr[:, :, 1] * temp2)
+        duv_dist_dxr_yr[:, :, 1, 0] = duv_dist_dxr_yr[:, :, 1, 0] + (
+            xr_yr[:, :, 0] * temp2
+        )
+        duv_dist_dxr_yr[:, :, 1, 1] = duv_dist_dxr_yr[:, :, 1, 1] + (
+            xr_yr[:, :, 1] * temp2
+        )
         # Compute 2x2 inverse manually here since torch.inverse() is very slow.
         # Because this is slow: inv = duv_dist_dxr_yr.inverse()
         # About a 10x reduction in speed with above line.
@@ -944,8 +1028,12 @@ def fisheye624_unproject_helper(uv, params, max_iters: int = 5):
 
 
 # unproject 2D point to 3D with fisheye624 model
-def fisheye624_unproject(coords: torch.Tensor, distortion_params: torch.Tensor) -> torch.Tensor:
-    dirs = fisheye624_unproject_helper(coords.unsqueeze(0), distortion_params[0].unsqueeze(0))
+def fisheye624_unproject(
+    coords: torch.Tensor, distortion_params: torch.Tensor
+) -> torch.Tensor:
+    dirs = fisheye624_unproject_helper(
+        coords.unsqueeze(0), distortion_params[0].unsqueeze(0)
+    )
     # correct for camera space differences:
     dirs[..., 1] = -dirs[..., 1]
     dirs[..., 2] = -dirs[..., 2]

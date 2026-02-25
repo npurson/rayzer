@@ -4,6 +4,7 @@ Camera Pose Evaluation Utilities
 Adapted from:
 https://github.com/facebookresearch/vggt/blob/evaluation/evaluation/test_co3d.py#L163
 """
+
 import torch
 import numpy as np
 
@@ -15,7 +16,11 @@ def closed_form_inverse_se3(se3):
     R_T = R.transpose(1, 2)
     t_new = -torch.bmm(R_T, T)
 
-    inv = torch.eye(4, device=se3.device, dtype=se3.dtype).unsqueeze(0).repeat(se3.size(0), 1, 1)
+    inv = (
+        torch.eye(4, device=se3.device, dtype=se3.dtype)
+        .unsqueeze(0)
+        .repeat(se3.size(0), 1, 1)
+    )
     inv[:, :3, :3] = R_T
     inv[:, :3, 3:] = t_new
 
@@ -55,12 +60,12 @@ def calculate_rpa(errors, thresholds):
 def evaluate_camera_pose_metrics(gt_c2w, pred_c2w, thresholds=[5, 15, 30]):
     """
     Evaluate relative camera pose accuracy between GT and predicted c2w matrices.
-    
+
     Args:
         gt_c2w: [V, 4, 4] ground truth camera-to-world matrices
         pred_c2w: [V, 4, 4] predicted camera-to-world matrices
         thresholds: list of angle thresholds in degrees for RPA computation
-    
+
     Returns:
         dict with RPA@threshold values, mean rotation error, and mean translation error
     """
@@ -68,8 +73,13 @@ def evaluate_camera_pose_metrics(gt_c2w, pred_c2w, thresholds=[5, 15, 30]):
 
     V = gt_c2w.shape[0]
     if V < 2:
-        return {"RPA@5": 0.0, "RPA@15": 0.0, "RPA@30": 0.0, 
-                "rot_err_mean": 0.0, "trans_err_mean": 0.0}
+        return {
+            "RPA@5": 0.0,
+            "RPA@15": 0.0,
+            "RPA@30": 0.0,
+            "rot_err_mean": 0.0,
+            "trans_err_mean": 0.0,
+        }
 
     i1, i2 = build_pair_index(V)
     i1, i2 = i1.to(device), i2.to(device)
@@ -87,7 +97,7 @@ def evaluate_camera_pose_metrics(gt_c2w, pred_c2w, thresholds=[5, 15, 30]):
 
     # Compute RPAs
     rpas = calculate_rpa(max_err, thresholds=thresholds)
-    
+
     # Also return mean errors for detailed analysis
     rpas["rot_err_mean"] = float(np.mean(r_err))
     rpas["trans_err_mean"] = float(np.mean(t_err))

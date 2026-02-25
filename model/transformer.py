@@ -10,10 +10,9 @@ except ImportError:
     raise ImportError("Please install xformers to use flashatt v2")
 
 
-
 def init_weights(module, std=0.02):
     """Initialize weights for linear and embedding layers.
-    
+
     Args:
         module: Module to initialize
         std: Standard deviation for normal initialization
@@ -49,13 +48,12 @@ class RMSNorm(nn.Module):
         return output * self.weight.type_as(x)
 
 
-
 class MLP(nn.Module):
     """
     Multi-Layer Perceptron block.
     Reference: https://github.com/facebookresearch/dino/blob/7c446df5b9f45747937fb0d72314eb9f7b66930a/vision_transformer.py#L49-L65
     """
-    
+
     def __init__(
         self,
         dim,
@@ -76,7 +74,7 @@ class MLP(nn.Module):
         """
         super().__init__()
         hidden_dim = mlp_dim if mlp_dim is not None else int(dim * mlp_ratio)
-        
+
         self.mlp = nn.Sequential(
             nn.Linear(dim, hidden_dim, bias=bias),
             activation(),
@@ -86,7 +84,6 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.mlp(x)
-
 
 
 class QK_Norm_SelfAttention(nn.Module):
@@ -117,8 +114,10 @@ class QK_Norm_SelfAttention(nn.Module):
         We use flash attention V2 for efficiency.
         """
         super().__init__()
-        assert dim % head_dim == 0, f"Token dimension {dim} should be divisible by head dimension {head_dim}"
-        
+        assert (
+            dim % head_dim == 0
+        ), f"Token dimension {dim} should be divisible by head dimension {head_dim}"
+
         self.dim = dim
         self.head_dim = head_dim
         self.num_heads = dim // head_dim
@@ -128,7 +127,7 @@ class QK_Norm_SelfAttention(nn.Module):
         self.to_qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
         self.fc = nn.Linear(dim, dim, bias=fc_bias)
         self.attn_fc_dropout = nn.Dropout(fc_dropout)
-        
+
         # Optional Q-K normalization
         if self.use_qk_norm:
             self.q_norm = RMSNorm(head_dim)
@@ -139,37 +138,40 @@ class QK_Norm_SelfAttention(nn.Module):
         Args:
             x: Input tensor of shape (batch, seq_len, dim)
             attn_bias: Optional attention bias mask
-            
+
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
         q, k, v = self.to_qkv(x).chunk(3, dim=-1)
-        
-        q, k, v = (rearrange(t, "b l (nh dh) -> b l nh dh", dh=self.head_dim) for t in (q, k, v))
-        
+
+        q, k, v = (
+            rearrange(t, "b l (nh dh) -> b l nh dh", dh=self.head_dim)
+            for t in (q, k, v)
+        )
+
         # Apply qk normalization if enabled
         if self.use_qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
 
         x = xops.memory_efficient_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             attn_bias=attn_bias,
             p=self.attn_dropout if self.training else 0.0,
             op=(xops.fmha.flash.FwOp, xops.fmha.flash.BwOp),
         )
-        
+
         x = rearrange(x, "b l nh dh -> b l (nh dh)")
         x = self.attn_fc_dropout(self.fc(x))
-        
+
         return x
-
-
 
 
 class SubsetAttention(nn.Module):
     """Attention that can attend to subsets of queries or keys/values."""
-    
+
     def __init__(
         self,
         dim,
@@ -178,7 +180,7 @@ class SubsetAttention(nn.Module):
         attn_dropout=0.0,
         fc_bias=False,
         fc_dropout=0.0,
-        use_qk_norm=False
+        use_qk_norm=False,
     ):
         """
         Args:
@@ -192,8 +194,10 @@ class SubsetAttention(nn.Module):
         We use flash attention V2 for efficiency.
         """
         super().__init__()
-        assert dim % head_dim == 0, f"Token dimension {dim} should be divisible by head dimension {head_dim}"
-        
+        assert (
+            dim % head_dim == 0
+        ), f"Token dimension {dim} should be divisible by head dimension {head_dim}"
+
         self.dim = dim
         self.head_dim = head_dim
         self.num_heads = dim // head_dim
@@ -204,7 +208,7 @@ class SubsetAttention(nn.Module):
         self.to_qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
         self.fc = nn.Linear(dim, dim, bias=fc_bias)
         self.attn_fc_dropout = nn.Dropout(fc_dropout)
-        
+
         # Optional Q-K normalization
         if self.use_qk_norm:
             self.q_norm = RMSNorm(head_dim)
@@ -216,30 +220,36 @@ class SubsetAttention(nn.Module):
             x: Input tensor of shape (batch, seq_len, dim)
             subset_kv_size: If provided, only attend to tokens after this index in KV
             subset_q_size: If provided, only compute attention for queries up to this index
-            
+
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
         # Only one subset parameter can be provided
-        assert not (subset_kv_size is not None and subset_q_size is not None), \
-            "Only one of subset_kv_size or subset_q_size can be provided"
+        assert not (
+            subset_kv_size is not None and subset_q_size is not None
+        ), "Only one of subset_kv_size or subset_q_size can be provided"
 
         q, k, v = self.to_qkv(x).chunk(3, dim=-1)
-        
-        q, k, v = (rearrange(t, "b l (nh dh) -> b l nh dh", dh=self.head_dim) for t in (q, k, v))
-        
+
+        q, k, v = (
+            rearrange(t, "b l (nh dh) -> b l nh dh", dh=self.head_dim)
+            for t in (q, k, v)
+        )
+
         if self.use_qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
-        
+
         # Handle subset attention cases
         if subset_kv_size is not None and subset_kv_size < k.shape[1]:
             # Attend to subset of key/value tokens
             k_subset = k[:, subset_kv_size:, :, :].contiguous()
             v_subset = v[:, subset_kv_size:, :, :].contiguous()
-            
+
             x = xops.memory_efficient_attention(
-                q, k_subset, v_subset,
+                q,
+                k_subset,
+                v_subset,
                 attn_bias=None,
                 p=self.attn_dropout if self.training else 0.0,
                 op=(xops.fmha.flash.FwOp, xops.fmha.flash.BwOp),
@@ -247,9 +257,11 @@ class SubsetAttention(nn.Module):
         elif subset_q_size is not None and subset_q_size < q.shape[1]:
             # Only compute attention for subset of query tokens
             q_subset = q[:, :subset_q_size, :, :].contiguous()
-            
+
             x = xops.memory_efficient_attention(
-                q_subset, k, v,
+                q_subset,
+                k,
+                v,
                 attn_bias=None,
                 p=self.attn_dropout if self.training else 0.0,
                 op=(xops.fmha.flash.FwOp, xops.fmha.flash.BwOp),
@@ -257,20 +269,20 @@ class SubsetAttention(nn.Module):
         else:
             # Regular attention for all tokens
             x = xops.memory_efficient_attention(
-                q, k, v,
+                q,
+                k,
+                v,
                 attn_bias=None,
                 p=self.attn_dropout if self.training else 0.0,
                 op=(xops.fmha.flash.FwOp, xops.fmha.flash.BwOp),
             )
-        
+
         x = rearrange(x, "b l nh dh -> b l (nh dh)")
 
         # Final projection
         x = self.attn_fc_dropout(self.fc(x))
-        
+
         return x
-
-
 
 
 class QK_Norm_TransformerBlock(nn.Module):
@@ -313,12 +325,7 @@ class QK_Norm_TransformerBlock(nn.Module):
             dropout=mlp_dropout,
         )
 
-
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
-
-
-
- 

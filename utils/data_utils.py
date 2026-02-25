@@ -24,7 +24,7 @@ def create_video_from_frames(frames, output_video_file, framerate=30):
     # Handle NaN and Inf values
     if not np.isfinite(frames).all():
         frames = np.nan_to_num(frames, nan=0.0, posinf=1.0, neginf=0.0)
-    
+
     # Clip to valid range and convert to uint8
     frames = np.clip(frames, 0.0, 1.0)
     frames = (frames * 255).astype(np.uint8)
@@ -54,9 +54,18 @@ class ProcessData(nn.Module):
         b, v = c2w.size()[:2]
         c2w = c2w.reshape(b * v, 4, 4)
 
-        fx, fy, cx, cy = fxfycxcy[:,:, 0], fxfycxcy[:,:,  1], fxfycxcy[:,:,  2], fxfycxcy[:,:,  3]
-        h_orig = int(2 * cy.max().item())  # Original height (estimated from the intrinsic matrix)
-        w_orig = int(2 * cx.max().item())  # Original width (estimated from the intrinsic matrix)
+        fx, fy, cx, cy = (
+            fxfycxcy[:, :, 0],
+            fxfycxcy[:, :, 1],
+            fxfycxcy[:, :, 2],
+            fxfycxcy[:, :, 3],
+        )
+        h_orig = int(
+            2 * cy.max().item()
+        )  # Original height (estimated from the intrinsic matrix)
+        w_orig = int(
+            2 * cx.max().item()
+        )  # Original width (estimated from the intrinsic matrix)
         if h is None or w is None:
             h, w = h_orig, w_orig
 
@@ -84,11 +93,11 @@ class ProcessData(nn.Module):
         ray_d = rearrange(ray_d, "(b v) (h w) c -> b v c h w", b=b, v=v, h=h, w=w, c=3)
 
         return ray_o, ray_d
-    
+
     def fetch_views(self, data_batch, has_target_image=False, target_has_input=True):
         """
         Splits the input data batch into input and target sets.
-        
+
         Args:
             data_batch (dict): Contains input tensors with the following keys:
                 - 'image' (torch.Tensor): Shape [b, v, c, h, w], optional for some target views
@@ -101,52 +110,70 @@ class ProcessData(nn.Module):
 
         """
         # randomize input views if dynamic_input_view_num is True and not in inference mode
-        if (self.config.training.get("dynamic_input_view_num", False) 
-            and (not self.config.inference.get("if_inference", False))):
+        if self.config.training.get("dynamic_input_view_num", False) and (
+            not self.config.inference.get("if_inference", False)
+        ):
             self.config.training.num_input_views = np.random.randint(2, 5)
-        
 
         input_dict, target_dict = {}, {}
         # index = [] save for future use if we want to select specific views
 
-        num_target_views, num_views, bs = self.config.training.num_target_views, data_batch["c2w"].size(1), data_batch["image"].size(0)
-        assert num_target_views < num_views, f"We have {num_views} views, but we want to select {num_target_views} target views. This is more than the total number of views we have."
-        
+        num_target_views, num_views, bs = (
+            self.config.training.num_target_views,
+            data_batch["c2w"].size(1),
+            data_batch["image"].size(0),
+        )
+        assert (
+            num_target_views < num_views
+        ), f"We have {num_views} views, but we want to select {num_target_views} target views. This is more than the total number of views we have."
+
         # Decide the target view indices
-        if target_has_input: 
+        if target_has_input:
             # Randomly sample target views across all views
-            index = torch.tensor([
-                random.sample(range(num_views), num_target_views)
-                for _ in range(bs)
-            ], dtype=torch.long, device=data_batch["image"].device) # [b, num_target_views]
+            index = torch.tensor(
+                [random.sample(range(num_views), num_target_views) for _ in range(bs)],
+                dtype=torch.long,
+                device=data_batch["image"].device,
+            )  # [b, num_target_views]
         else:
             assert (
-                self.config.training.num_input_views + num_target_views <= self.config.training.num_views
+                self.config.training.num_input_views + num_target_views
+                <= self.config.training.num_views
             ), f"We have {self.config.training.num_views} views in total, but we want to select {self.config.training.num_input_views} input views and {num_target_views} target views. This is more than the total number of views we have."
-            
-            index = torch.tensor([
-                [self.config.training.num_views - 1 - j for j in range(num_target_views)]
-                for _ in range(bs)
-            ], dtype=torch.long, device=data_batch["image"].device)
-            index = torch.sort(index, dim=1).values # [b, num_target_views]
 
+            index = torch.tensor(
+                [
+                    [
+                        self.config.training.num_views - 1 - j
+                        for j in range(num_target_views)
+                    ]
+                    for _ in range(bs)
+                ],
+                dtype=torch.long,
+                device=data_batch["image"].device,
+            )
+            index = torch.sort(index, dim=1).values  # [b, num_target_views]
 
         for key, value in data_batch.items():
             if key == "scene_name":
                 input_dict[key] = value
                 target_dict[key] = value
                 continue
-            input_dict[key] = value[:, :self.config.training.num_input_views, ...]
+            input_dict[key] = value[:, : self.config.training.num_input_views, ...]
 
-            to_expand_dim = value.shape[2:] # [b, v, (value dim)] -> [value dim], e.g. [c, h, w] or [4] or [4, 4]
-            expanded_index = index.view(index.shape[0], index.shape[1], *(1,) * len(to_expand_dim)).expand(-1, -1, *to_expand_dim)
+            to_expand_dim = value.shape[
+                2:
+            ]  # [b, v, (value dim)] -> [value dim], e.g. [c, h, w] or [4] or [4, 4]
+            expanded_index = index.view(
+                index.shape[0], index.shape[1], *(1,) * len(to_expand_dim)
+            ).expand(-1, -1, *to_expand_dim)
 
-            # Don't have target image supervision 
-            if key == "image" and not has_target_image:                
+            # Don't have target image supervision
+            if key == "image" and not has_target_image:
                 continue
             else:
                 target_dict[key] = torch.gather(value, dim=1, index=expanded_index)
-        
+
         height, width = data_batch["image"].shape[3], data_batch["image"].shape[4]
         input_dict["image_h_w"] = (height, width)
         target_dict["image_h_w"] = (height, width)
@@ -155,10 +182,14 @@ class ProcessData(nn.Module):
 
         return input_dict, target_dict
 
-
-    
     @torch.no_grad()
-    def forward(self, data_batch, has_target_image=True, target_has_input=True, compute_rays=True):
+    def forward(
+        self,
+        data_batch,
+        has_target_image=True,
+        target_has_input=True,
+        compute_rays=True,
+    ):
         """
         Preprocesses the input data batch and (optionally) computes ray_o and ray_d.
 
@@ -170,7 +201,7 @@ class ProcessData(nn.Module):
             has_target_image (bool): If True, target views have image supervision.
             target_has_input (bool): If True, target views can be sampled from input views.
             compute_rays (bool): If True, compute ray_o and ray_d.
-                
+
         Returns:
             Input and Target data_batch (dict): Contains processed tensors with the following keys:
                 - 'image' (torch.Tensor): Shape [b, v, c, h, w]
@@ -180,7 +211,11 @@ class ProcessData(nn.Module):
                 - 'ray_d' (torch.Tensor): Shape [b, v, 3, h, w]
                 - 'image_h_w' (tuple): (height, width)
         """
-        input_dict, target_dict = self.fetch_views(data_batch, has_target_image=has_target_image, target_has_input=target_has_input)
+        input_dict, target_dict = self.fetch_views(
+            data_batch,
+            has_target_image=has_target_image,
+            target_has_input=target_has_input,
+        )
 
         if compute_rays:
             for dict in [input_dict, target_dict]:
@@ -188,32 +223,42 @@ class ProcessData(nn.Module):
                 fxfycxcy = dict["fxfycxcy"]
                 image_height, image_width = dict["image_h_w"]
 
-                ray_o, ray_d = self.compute_rays(c2w, fxfycxcy, image_height, image_width, device=data_batch["image"].device)
+                ray_o, ray_d = self.compute_rays(
+                    c2w,
+                    fxfycxcy,
+                    image_height,
+                    image_width,
+                    device=data_batch["image"].device,
+                )
                 dict["ray_o"], dict["ray_d"] = ray_o, ray_d
 
         return input_dict, target_dict
 
-      
-      
+
 class SplitData(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        
+
         # Basic check: we want num_input_views + num_target_views = num_views
         assert (
-            self.config.training.num_views 
-            == self.config.training.num_input_views + self.config.training.num_target_views
+            self.config.training.num_views
+            == self.config.training.num_input_views
+            + self.config.training.num_target_views
         ), "num_input_views + num_target_views must equal num_views"
-        
+
         # Precompute input and target indices (no overlap, evenly spaced)
         self.input_pattern, self.target_pattern = self._build_indices(
             total_views=self.config.training.num_views,
             num_input_views=self.config.training.num_input_views,
-            num_target_views=self.config.training.num_target_views
+            num_target_views=self.config.training.num_target_views,
         )
 
-        print('When not using random index, input and target indices are:', self.input_pattern, self.target_pattern)
+        print(
+            "When not using random index, input and target indices are:",
+            self.input_pattern,
+            self.target_pattern,
+        )
         # tmp1, tmp2 = self.input_pattern[-1].clone(), self.target_pattern[-1].clone()
         # self.target_pattern[-1] = tmp1
         # self.input_pattern[-1] = tmp2
@@ -225,8 +270,8 @@ class SplitData(nn.Module):
         We'll slice along dimension 1 (the 'view' dimension).
         """
         input_dict, target_dict = {}, {}
-        B, V = data_batch['image'].shape[:2]
-        batch_idx = torch.arange(B).unsqueeze(1).to(data_batch['image'].device)
+        B, V = data_batch["image"].shape[:2]
+        batch_idx = torch.arange(B).unsqueeze(1).to(data_batch["image"].device)
 
         if "context_indices" in data_batch and "target_indices" in data_batch:
             # use loaded view indices, for evaluation
@@ -237,10 +282,12 @@ class SplitData(nn.Module):
             if random_index:
                 input_pattern, target_pattern = self.get_random_index(B, V)
             else:
-                input_pattern, target_pattern = self.input_pattern.unsqueeze(0).repeat(B,1), self.target_pattern.unsqueeze(0).repeat(B,1)
+                input_pattern, target_pattern = self.input_pattern.unsqueeze(0).repeat(
+                    B, 1
+                ), self.target_pattern.unsqueeze(0).repeat(B, 1)
 
         for key, value in data_batch.items():
-            if key in set(['scene_name', 'context_indices', 'target_indices']):
+            if key in set(["scene_name", "context_indices", "target_indices"]):
                 continue
             # value shape: [B, V, ...]
             B, V = value.shape[:2]
@@ -249,15 +296,14 @@ class SplitData(nn.Module):
                 raise ValueError(
                     f"Expected {key} to have {expected_views} views, got {V}."
                 )
-                
+
             input_dict[key] = value[batch_idx, input_pattern, ...]
             target_dict[key] = value[batch_idx, target_pattern, ...]
-        
-        input_dict['scene_name'] = data_batch['scene_name']
-        target_dict['scene_name'] = data_batch['scene_name']
-                
-        return edict(input_dict), edict(target_dict), input_pattern, target_pattern
 
+        input_dict["scene_name"] = data_batch["scene_name"]
+        target_dict["scene_name"] = data_batch["scene_name"]
+
+        return edict(input_dict), edict(target_dict), input_pattern, target_pattern
 
     def _build_indices(self, total_views, num_input_views, num_target_views):
         """
@@ -272,7 +318,7 @@ class SplitData(nn.Module):
         in_per_group = num_input_views // g
         tar_per_group = num_target_views // g
 
-        input_indices  = []
+        input_indices = []
         target_indices = []
 
         for group_idx in range(g):
@@ -284,28 +330,33 @@ class SplitData(nn.Module):
             target_indices.extend(block[in_per_group : in_per_group + tar_per_group])
 
         # Convert to torch.LongTensor
-        input_indices  = torch.tensor(input_indices,  dtype=torch.long)
+        input_indices = torch.tensor(input_indices, dtype=torch.long)
         target_indices = torch.tensor(target_indices, dtype=torch.long)
         input_indices, _ = torch.sort(input_indices)
         target_indices, _ = torch.sort(target_indices)
 
         return input_indices, target_indices
-    
 
     def get_random_index(self, b, v):
         total_views = self.config.training.num_views
         num_input_views = self.config.training.num_input_views
         num_target_views = self.config.training.num_target_views
-        random_shuffle = self.config.training.view_selector.get('shuffle', False)
+        random_shuffle = self.config.training.view_selector.get("shuffle", False)
 
-        assert num_input_views + num_target_views == total_views, "Mismatch in total views allocation."
+        assert (
+            num_input_views + num_target_views == total_views
+        ), "Mismatch in total views allocation."
 
         rand_vals = torch.rand(b, v)  # shape [B, V]
         perms = rand_vals.argsort(dim=1)  # shape [B, V]
 
         # Ensure at least one index in input is smaller than all in target, and one index in input is larger than all in target
-        idx_part1 = torch.zeros((b, num_input_views), dtype=torch.long, device=perms.device)
-        idx_part2 = torch.zeros((b, num_target_views), dtype=torch.long, device=perms.device)
+        idx_part1 = torch.zeros(
+            (b, num_input_views), dtype=torch.long, device=perms.device
+        )
+        idx_part2 = torch.zeros(
+            (b, num_target_views), dtype=torch.long, device=perms.device
+        )
 
         for i in range(b):
             # Ensure the first index in input is always 0 and the last index is always v-1
@@ -313,18 +364,26 @@ class SplitData(nn.Module):
             idx_part1[i, -1] = v - 1
 
             # Remaining indices to choose from
-            remaining_indices = torch.arange(1, v - 1, device=perms.device)  # Exclude 0 and v-1
+            remaining_indices = torch.arange(
+                1, v - 1, device=perms.device
+            )  # Exclude 0 and v-1
 
             # Randomly sample (num_input_views - 2) indices from remaining
             middle_size = num_input_views - 2
-            middle_indices = remaining_indices[torch.randperm(len(remaining_indices))[:middle_size]]
+            middle_indices = remaining_indices[
+                torch.randperm(len(remaining_indices))[:middle_size]
+            ]
             middle_indices, _ = middle_indices.sort()  # Ensure sorted order
             # Assign middle indices to idx_part1
-            idx_part1[i, 1:-1] = middle_indices  
+            idx_part1[i, 1:-1] = middle_indices
 
             # Target indices are the remaining ones
-            idx_part2_indeices = torch.tensor([x for x in range(v) if x not in idx_part1[i]], device=perms.device)
-            idx_part2_indeices, _ = idx_part2_indeices.sort()  # Ensure sorted order for target
+            idx_part2_indeices = torch.tensor(
+                [x for x in range(v) if x not in idx_part1[i]], device=perms.device
+            )
+            idx_part2_indeices, _ = (
+                idx_part2_indeices.sort()
+            )  # Ensure sorted order for target
             idx_part2[i] = idx_part2_indeices
 
             if random_shuffle:
@@ -332,4 +391,3 @@ class SplitData(nn.Module):
                 idx_part2[i] = idx_part2[i][torch.randperm(num_target_views)]
 
         return idx_part1, idx_part2
-    
