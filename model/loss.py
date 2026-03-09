@@ -33,7 +33,9 @@ class PerceptualLoss(nn.Module):
 
     def _load_weights(self):
         """Load pre-trained VGG weights."""
-        weight_file = Path("./metric_checkpoint/imagenet-vgg-verydeep-19.mat")
+        weight_file = Path(
+            "/horizon-bucket/robot_lab/users/haoyi.jiang/repos/rayzer/ckpts/metric_checkpoint/imagenet-vgg-verydeep-19.mat"
+        )
         weight_file.parent.mkdir(exist_ok=True, parents=True)
 
         if torch.distributed.get_rank() == 0:
@@ -45,7 +47,7 @@ class PerceptualLoss(nn.Module):
         torch.distributed.barrier()
 
         # Load MatConvNet weights
-        vgg_data = scipy.io.loadmat(weight_file)
+        vgg_data = scipy.io.loadmat(str(weight_file))
         vgg_layers = vgg_data["layers"][0]
 
         # Layer indices and filter sizes
@@ -178,11 +180,7 @@ class LossComputer(nn.Module):
             param.requires_grad = False
         return module
 
-    def forward(
-        self,
-        rendering,
-        target,
-    ):
+    def forward(self, rendering, target):
         """
         Calculate various losses between rendering and target images.
 

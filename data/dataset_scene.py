@@ -79,11 +79,15 @@ class Dataset(Dataset):
         )
 
         if self.config.training.view_selector.get("use_curriculum", False):
-            print(
-                "Current curriculum progress: {}, min_dist: {}, max_dist: {}".format(
-                    progress, cur_min_frame_dist, cur_max_frame_dist
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ):
+                print(
+                    "Current curriculum progress: {}, min_dist: {}, max_dist: {}".format(
+                        progress, cur_min_frame_dist, cur_max_frame_dist
+                    )
                 )
-            )
 
     def preprocess_frames(self, frames_chosen, image_paths_chosen):
         target_size = self.config.model.image_tokenizer.image_size
@@ -144,11 +148,7 @@ class Dataset(Dataset):
         c2ws = torch.from_numpy(c2ws).float()
         return images, intrinsics, c2ws
 
-    def preprocess_poses(
-        self,
-        in_c2ws: torch.Tensor,
-        scene_scale_factor=1.35,
-    ):
+    def preprocess_poses(self, in_c2ws: torch.Tensor, scene_scale_factor=1.35):
         """
         Preprocess the poses to:
         1. translate and rotate the scene to align the average camera direction and position

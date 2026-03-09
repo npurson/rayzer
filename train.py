@@ -3,13 +3,12 @@
 import importlib
 import os
 import time
-import wandb
 import torch
 from rich import print
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 import torch.distributed as dist
-from setup import init_config, init_distributed, init_wandb_and_backup
+from setup import init_config, init_distributed, init_logging_and_backup, TrainLogger
 from utils.metric_utils import visualize_intermediate_results
 from utils.training_utils import (
     create_optimizer,
@@ -27,9 +26,11 @@ os.environ["OMP_NUM_THREADS"] = str(config.training.get("num_threads", 1))
 ddp_info = init_distributed(seed=777)
 dist.barrier()
 
-# Set up wandb and backup source code
+# Set up logging (wandb / tensorboard) and backup source code
 if ddp_info.is_main_process:
-    init_wandb_and_backup(config)
+    logger = init_logging_and_backup(config)
+else:
+    logger = TrainLogger(backend="disabled")
 dist.barrier()
 
 
@@ -244,7 +245,7 @@ while cur_train_step <= total_train_steps:
                             param.grad.detach().norm().item()
                         )  # Detach for safety
                 for layer_name, grad_norm in grad_norms.items():
-                    wandb.log(
+                    logger.log(
                         {"grad_norm_details/" + layer_name: grad_norm},
                         step=cur_train_step,
                     )
@@ -277,7 +278,7 @@ while cur_train_step <= total_train_steps:
                     or total_grad_norm > allowed_gradnorm
                 )
                 if display_grad_norm and ddp_info.is_main_process:
-                    wandb.log({"grad_norm": total_grad_norm}, step=cur_train_step)
+                    logger.log({"grad_norm": total_grad_norm}, step=cur_train_step)
 
             # since skip flag may be updated because of grad norm, we check it again
             if not skip_optimizer_step:
@@ -304,7 +305,7 @@ while cur_train_step <= total_train_steps:
                 print_str += f"{k}: {v:.6f} | "
             print(print_str)
 
-        # log in wandb
+        # log metrics
         if (cur_train_step % config.training.wandb_log_every == 0) or (
             cur_train_step < 200 + start_train_step
         ):
@@ -318,7 +319,7 @@ while cur_train_step <= total_train_steps:
                 "epoch": cur_epoch,
             }
             log_dict.update({"train/" + k: v for k, v in loss_dict.items()})
-            wandb.log(
+            logger.log(
                 log_dict,
                 step=cur_train_step,
             )
@@ -363,4 +364,5 @@ while cur_train_step <= total_train_steps:
 
 
 dist.barrier()
+logger.close()
 dist.destroy_process_group()

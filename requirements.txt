@@ -20,3 +20,4 @@ lpips
 jaxtyping
 scikit-image
 numpy
+tensorboard

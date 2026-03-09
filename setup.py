@@ -224,35 +224,77 @@ def local_backup_src_code(
     return successful_copies, total_size
 
 
-def init_wandb_and_backup(config):
-    # WandB mode: "online" (default), "offline" (save locally), "disabled" (no wandb)
-    wandb_mode = config.training.get("wandb_mode", "online")
+class TrainLogger:
+    """Unified logging interface supporting wandb and tensorboard backends."""
 
-    if wandb_mode == "disabled":
+    def __init__(self, backend="wandb"):
+        self.backend = backend
+        self._tb_writer = None
+
+    def init_tensorboard(self, log_dir):
+        from torch.utils.tensorboard import SummaryWriter
+
+        self._tb_writer = SummaryWriter(log_dir=log_dir)
+
+    def log(self, log_dict, step=None):
+        if self.backend == "wandb":
+            wandb.log(log_dict, step=step)
+        elif self.backend == "tensorboard" and self._tb_writer is not None:
+            for k, v in log_dict.items():
+                if v is not None:
+                    self._tb_writer.add_scalar(k, v, global_step=step)
+
+    def log_code(self, *args, **kwargs):
+        if self.backend == "wandb" and wandb.run is not None:
+            wandb.run.log_code(*args, **kwargs)
+
+    def close(self):
+        if self._tb_writer is not None:
+            self._tb_writer.close()
+
+
+def init_logging_and_backup(config):
+    """Initialize logging backend (wandb / tensorboard / disabled) and backup source code."""
+    log_backend = config.training.get("log_backend", "wandb")
+
+    if log_backend == "tensorboard":
+        tb_log_dir = os.path.join(config.training.checkpoint_dir, "tb_logs")
+        os.makedirs(tb_log_dir, exist_ok=True)
+        print(f"[TensorBoard] Logging to {tb_log_dir}")
+
         os.environ["WANDB_MODE"] = "disabled"
-        print("[WandB] Disabled - no logging")
         wandb.init(mode="disabled")
-    else:
-        if wandb_mode == "offline":
-            os.environ["WANDB_MODE"] = "offline"
-            print("[WandB] Offline mode - logs saved locally in ./wandb/")
-        else:
-            # Online mode - need API key
-            assert os.path.exists(
-                config.training.api_key_path
-            ), f"API key file does not exist: {config.training.api_key_path}"
-            api_keys = edict(yaml.safe_load(open(config.training.api_key_path, "r")))
-            assert api_keys.wandb is not None, "Wandb API key not found in api key file"
-            os.environ["WANDB_API_KEY"] = api_keys.wandb
 
-        # WandB initialization
-        config_copy = copy.deepcopy(config)
-        wandb.init(
-            project=config.training.wandb_project,
-            name=config.training.wandb_exp_name,
-            config=config_copy,
-            mode=wandb_mode,
-        )
+        logger = TrainLogger(backend="tensorboard")
+        logger.init_tensorboard(tb_log_dir)
+    else:
+        wandb_mode = config.training.get("wandb_mode", "online")
+
+        if wandb_mode == "disabled":
+            os.environ["WANDB_MODE"] = "disabled"
+            print("[WandB] Disabled - no logging")
+            wandb.init(mode="disabled")
+        else:
+            if wandb_mode == "offline":
+                os.environ["WANDB_MODE"] = "offline"
+                print("[WandB] Offline mode - logs saved locally in ./wandb/")
+            else:
+                assert os.path.exists(
+                    config.training.api_key_path
+                ), f"API key file does not exist: {config.training.api_key_path}"
+                api_keys = edict(yaml.safe_load(open(config.training.api_key_path, "r")))
+                assert api_keys.wandb is not None, "Wandb API key not found in api key file"
+                os.environ["WANDB_API_KEY"] = api_keys.wandb
+
+            config_copy = copy.deepcopy(config)
+            wandb.init(
+                project=config.training.wandb_project,
+                name=config.training.wandb_exp_name,
+                config=config_copy,
+                mode=wandb_mode,
+            )
+
+        logger = TrainLogger(backend="wandb" if wandb_mode != "disabled" else "disabled")
 
     # Source code backup
     cur_dir = os.path.dirname(os.path.realpath(__file__))
@@ -269,7 +311,9 @@ def init_wandb_and_backup(config):
     with open(config_save_path, "w") as f:
         yaml.dump(dict(config), f)
 
-    wandb.run.log_code(
+    logger.log_code(
         trgt_dir,
         include_fn=lambda path: path.endswith(extension_to_backup),
     )
+
+    return logger
