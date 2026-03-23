@@ -2,12 +2,22 @@
 
 import random
 import os
+import signal
+import traceback
 import numpy as np
 import PIL
 import torch
 from torch.utils.data import Dataset
 import json
 import torch.nn.functional as F
+
+
+class _SceneLoadTimeout(Exception):
+    pass
+
+
+def _sigalrm_handler(signum, frame):
+    raise _SceneLoadTimeout("scene loading timed out")
 
 
 class Dataset(Dataset):
@@ -234,11 +244,28 @@ class Dataset(Dataset):
                 f"View selector type {view_selector_config.type} with curriculum {use_curriculum} is not implemented"
             )
 
+    def _load_scene_with_timeout(self, idx, timeout=15):
+        """Wrap _load_scene with a SIGALRM-based timeout to prevent I/O hangs."""
+        prev_handler = signal.signal(signal.SIGALRM, _sigalrm_handler)
+        signal.alarm(timeout)
+        try:
+            result = self._load_scene(idx)
+            signal.alarm(0)
+            return result
+        except _SceneLoadTimeout:
+            signal.alarm(0)
+            raise RuntimeError(
+                f"[Dataset] Scene loading timed out after {timeout}s (idx={idx})"
+            )
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, prev_handler)
+
     def __getitem__(self, idx):
         max_retries = 10
         for retry in range(max_retries):
             try:
-                return self._load_scene(idx)
+                return self._load_scene_with_timeout(idx, timeout=15)
             except Exception as e:
                 scene_path = (
                     self.all_scene_paths[idx].strip()
@@ -248,6 +275,7 @@ class Dataset(Dataset):
                 print(
                     f"[Dataset] Error loading scene {scene_path}: {e}. Retrying with another scene ({retry+1}/{max_retries})..."
                 )
+                traceback.print_exc()
                 idx = random.randint(0, len(self) - 1)
         raise RuntimeError(
             f"[Dataset] Failed to load any scene after {max_retries} retries"
@@ -312,11 +340,15 @@ class Dataset(Dataset):
 
 
 def two_frame_selector(frames, num_views, min_frame_dist, max_frame_dist):
+    n_rest = num_views - 2
     frame_dist = random.randint(min_frame_dist, max_frame_dist)
     if len(frames) <= frame_dist:
         return []
+    # indices strictly between start and end: frame_dist - 1 slots available
+    if n_rest > frame_dist - 1:
+        return []
     start_frame = random.randint(0, len(frames) - frame_dist - 1)
     end_frame = start_frame + frame_dist
-    rest_frames = random.sample(range(start_frame + 1, end_frame), num_views - 2)
+    rest_frames = random.sample(range(start_frame + 1, end_frame), n_rest)
     frame_indices = [start_frame] + rest_frames + [end_frame]
     return frame_indices

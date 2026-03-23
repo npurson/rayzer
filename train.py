@@ -189,7 +189,7 @@ while cur_train_step <= total_train_steps:
     ):
         if "LVSM" in config.model.class_name:
             ret_dict = model(batch)
-        elif "rayzer" in config.model.class_name:
+        elif any(k in config.model.class_name for k in ("rayzer", "erayzer", "spa3r")):
             ret_dict = model(
                 batch, create_visual=create_visual, render_video=render_video
             )
@@ -256,14 +256,14 @@ while cur_train_step <= total_train_steps:
                     optim_param_list, max_norm=config.training.grad_clip_norm
                 ).item()
 
+                allowed_gradnorm = config.training.grad_clip_norm * config.training.get(
+                    "allowed_gradnorm_factor", 5
+                )
+
                 if total_grad_norm > config.training.grad_clip_norm * 2.0:
                     print(
                         f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {config.training.grad_clip_norm * 2.0}"
                     )
-
-                allowed_gradnorm = config.training.grad_clip_norm * config.training.get(
-                    "allowed_gradnorm_factor", 5
-                )
                 if (total_grad_norm > allowed_gradnorm) and (
                     cur_train_step > config.training.get("no_pass_steps", -1)
                 ):
@@ -349,12 +349,16 @@ while cur_train_step <= total_train_steps:
             )
 
         # export intermediate visualization results
-        if create_visual:
+        if create_visual and hasattr(ret_dict, "input") and ret_dict.input is not None:
             vis_path = os.path.join(
                 config.training.checkpoint_dir, f"iter_{cur_train_step:08d}"
             )
             os.makedirs(vis_path, exist_ok=True)
-            visualize_intermediate_results(vis_path, ret_dict)
+            supervision_image = visualize_intermediate_results(vis_path, ret_dict)
+            if supervision_image is not None:
+                logger.log_image(
+                    "train/gt_vs_pred", supervision_image, step=cur_train_step
+                )
             torch.cuda.empty_cache()
             model.train()
 

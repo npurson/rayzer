@@ -244,6 +244,16 @@ class TrainLogger:
                 if v is not None:
                     self._tb_writer.add_scalar(k, v, global_step=step)
 
+    def log_image(self, key, image_hwc_uint8, step=None):
+        """Log an image (H, W, C) uint8 numpy array to wandb or tensorboard."""
+        if self.backend == "wandb" and wandb.run is not None:
+            wandb.log({key: wandb.Image(image_hwc_uint8)}, step=step)
+        elif self.backend == "tensorboard" and self._tb_writer is not None:
+            import numpy as np
+            # tensorboard add_image expects (C, H, W), float [0, 1]
+            img_chw = image_hwc_uint8.transpose(2, 0, 1).astype(np.float32) / 255.0
+            self._tb_writer.add_image(key, img_chw, global_step=step)
+
     def log_code(self, *args, **kwargs):
         if self.backend == "wandb" and wandb.run is not None:
             wandb.run.log_code(*args, **kwargs)
@@ -258,7 +268,7 @@ def init_logging_and_backup(config):
     log_backend = config.training.get("log_backend", "wandb")
 
     if log_backend == "tensorboard":
-        tb_log_dir = os.path.join(config.training.checkpoint_dir, "tb_logs")
+        tb_log_dir = "/job_tboard"
         os.makedirs(tb_log_dir, exist_ok=True)
         print(f"[TensorBoard] Logging to {tb_log_dir}")
 
