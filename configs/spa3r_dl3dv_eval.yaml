@@ -5,7 +5,7 @@ model:
   aggregator_depth: 12
   decoder_depth: 12
   patch_size: 14
-  image_size: 256
+  image_size: 336
   num_register_tokens: 4
   mlp_ratio: 4.0
   init_values: 0.01
@@ -16,12 +16,12 @@ model:
   freeze_backbone: true
   pose_head_depth: 4
   image_tokenizer:
-    image_size: 256
+    image_size: 336
     patch_size: 14
     in_channels: 3
   target_image:
-    height: 256
-    width: 256
+    height: 336
+    width: 336
     patch_size: 14
     in_channels: 6
 
