@@ -20,6 +20,7 @@ from vggt.heads.head_act import activate_pose
 from vggt.utils.rotation import quat_to_mat
 
 from .loss import LossComputer
+from .xfactor import _MLP2, _MLP3, _MVLayer, _get_2d_sincos_rope
 
 try:
     import lpips as lpips_lib
@@ -151,25 +152,125 @@ class PosePredictor(nn.Module):
         return [result]
 
 
+class LatentPoseHead(nn.Module):
+    """xFactor-style latent pose head: proj(cat(z, z0)) - proj(cat(z0, z0))."""
+
+    def __init__(self, feat_dim, pose_dim):
+        super().__init__()
+        self.proj = _MLP3(feat_dim * 2, feat_dim, pose_dim)
+
+    def forward(self, z, z0):
+        p = torch.cat([z, z0], dim=-1)
+        p0 = torch.cat([z0, z0], dim=-1)
+        return self.proj(p) - self.proj(p0)
+
+
+class LatentRenderer(nn.Module):
+    """xFactor-style renderer with optional encoder context features."""
+
+    def __init__(self, dim, num_heads, num_layers, patch_size, pose_dim, use_checkpoint=True):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.patch_size = patch_size
+        self.use_checkpoint = use_checkpoint
+
+        self.ctx_feat_proj = nn.Linear(dim, dim, bias=True)
+        self.ctx_lift = _MLP2(patch_size * patch_size * 3 + pose_dim, dim, dim)
+        self.tgt_lift = _MLP2(pose_dim, dim, dim)
+        self.layers = nn.ModuleList([_MVLayer(dim, num_heads) for _ in range(num_layers)])
+        self.pixel_norm = nn.LayerNorm(dim)
+        self.pixel_head = _MLP3(dim, dim, patch_size * patch_size * 3)
+
+    def forward(self, ctx_feat, x_ctx, P, pmask=None):
+        """
+        ctx_feat: (B, V_ctx, N, C) encoder patch features or None
+        x_ctx:    (B, V_ctx, 3, H, W) in [0, 1]
+        P:        (B, V, 2, Cp) or (B, V, Cp), V = V_ctx + 1
+        pmask:    (B, N) values {0, 1} or None
+        Returns:  (B, 3, H, W) in [0, 1]
+        """
+        B, V_ctx, _, H, W = x_ctx.shape
+        V = P.shape[1]
+        ps = self.patch_size
+        Hp, Wp = H // ps, W // ps
+        N = Hp * Wp
+
+        patches = rearrange(
+            x_ctx, "b v c (hp ph) (wp pw) -> b v (hp wp) (ph pw c)", ph=ps, pw=ps
+        )
+
+        if pmask is None:
+            pmask = patches.new_zeros(B, N, dtype=torch.long)
+        pmask_v = pmask.unsqueeze(1).expand(-1, V, -1)
+
+        if P.ndim == 3:
+            P0 = P1 = P.unsqueeze(2)
+        else:
+            P0, P1 = P[:, :, 0:1], P[:, :, 1:2]
+        mask_f = pmask_v.unsqueeze(-1).float()
+        P_sp = (1.0 - mask_f) * P0 + mask_f * P1
+
+        ctx = self.ctx_lift(torch.cat([patches, P_sp[:, :V_ctx]], dim=-1))
+        if ctx_feat is not None:
+            ctx = ctx + self.ctx_feat_proj(ctx_feat)
+        tgt = self.tgt_lift(P_sp[:, -1])
+        z = torch.cat([ctx, tgt.unsqueeze(1)], dim=1)
+
+        rope = _get_2d_sincos_rope(self.head_dim, Hp, Wp, z.device, z.dtype)
+        for layer in self.layers:
+            if self.use_checkpoint and self.training:
+                z = torch_checkpoint(layer, z, pmask_v, rope, use_reentrant=False)
+            else:
+                z = layer(z, pmask_v, rope)
+
+        z_tgt = z[:, -1]
+        rgb = self.pixel_head(F.gelu(self.pixel_norm(z_tgt)))
+        rgb = torch.sigmoid(rgb)
+        return rearrange(
+            rgb, "b (hp wp) (ph pw c) -> b c (hp ph) (wp pw)",
+            hp=Hp, wp=Wp, ph=ps, pw=ps, c=3,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
 
-def generate_quadrant_mask(B, H_patches, W_patches, device):
-    """0 = aug_a, 1 = aug_b.  Returns [B, N_patches]."""
+def generate_quadrant_mask(B, H_patches, W_patches, device,
+                           full_chance=0.0, empty_chance=0.0):
+    """Returns (pmask, qc) where pmask is [B, N] in {0,1}.
+
+    By default samples follow the 2-visible / 2-masked quadrant split.
+    ``full_chance`` forces all quadrants visible (qc == 0), while
+    ``empty_chance`` forces all quadrants masked (qc == 4).
+    """
     assert H_patches % 2 == 0 and W_patches % 2 == 0
+    if full_chance < 0.0 or empty_chance < 0.0 or full_chance + empty_chance > 1.0:
+        raise ValueError(
+            f"Expected 0 <= full_chance + empty_chance <= 1, got "
+            f"full_chance={full_chance}, empty_chance={empty_chance}"
+        )
     H2, W2 = H_patches // 2, W_patches // 2
     q = torch.zeros(B, 4, dtype=torch.long, device=device)
     q[:, 2:] = 1
+    mask_mode = torch.rand(B, device=device)
+    full = mask_mode <= full_chance
+    empty = (mask_mode > full_chance) & (mask_mode <= full_chance + empty_chance)
+    q[full] = 0
+    q[empty] = 1
     for i in range(B):
         q[i] = q[i, torch.randperm(4, device=device)]
+    qc = q.sum(1)
     q00 = q[:, 0].view(B, 1, 1).expand(-1, H2, W2)
     q10 = q[:, 1].view(B, 1, 1).expand(-1, H2, W2)
     q01 = q[:, 2].view(B, 1, 1).expand(-1, H2, W2)
     q11 = q[:, 3].view(B, 1, 1).expand(-1, H2, W2)
     top = torch.cat([q00, q10], dim=2)
     bot = torch.cat([q01, q11], dim=2)
-    return torch.cat([top, bot], dim=1).reshape(B, -1)
+    pmask = torch.cat([top, bot], dim=1).reshape(B, -1)
+    return pmask, qc
 
 
 def cam_to_plucker(c2w, fxfycxcy, h, w):
@@ -262,7 +363,8 @@ class Spa3R(nn.Module):
         self.w_patches = img_sz // ps
         self.n_patches = self.h_patches * self.w_patches
         self.num_register_tokens = n_reg
-        self.patch_start_idx = 1 + n_reg
+        self.num_pose_tokens = config.model.get("num_pose_tokens", 32)
+        self.patch_start_idx = self.num_pose_tokens + n_reg
 
         # --- backbone ---
         self._build_patch_embed(config, n_reg)
@@ -283,7 +385,7 @@ class Spa3R(nn.Module):
         self.agg_depth = agg_depth
 
         # --- camera / pose tokens ---
-        self.camera_token = nn.Parameter(torch.randn(1, 2, 1, D))
+        self.camera_token = nn.Parameter(torch.randn(1, 2, self.num_pose_tokens, D))
         self.register_token = nn.Parameter(torch.randn(1, 2, n_reg, D))
         nn.init.normal_(self.camera_token, std=1e-6)
         nn.init.normal_(self.register_token, std=1e-6)
@@ -293,42 +395,14 @@ class Spa3R(nn.Module):
 
         # --- pose predictor ---
         self.pose_predictor = PosePredictor(dim=D)
+        for p in self.pose_predictor.parameters():
+            p.requires_grad_(False)
 
-        # --- decoder ---
-        self.plucker_tokenizer = nn.Sequential(
-            Rearrange(
-                "b c (hh ph) (ww pw) -> b (hh ww) (ph pw c)",
-                ph=ps, pw=ps,
-            ),
-            nn.Linear(6 * ps * ps, D, bias=False),
-        )
-        self.raw_rgb_tokenizer = nn.Sequential(
-            Rearrange(
-                "b c (hh ph) (ww pw) -> b (hh ww) (ph pw c)",
-                ph=ps, pw=ps,
-            ),
-            nn.Linear(3 * ps * ps, D, bias=False),
-        )
-        self.mlp_fuse = nn.Sequential(
-            nn.LayerNorm(D * 3),
-            nn.Linear(D * 3, D, bias=True),
-            nn.SiLU(),
-            nn.Linear(D, D, bias=True),
-        )
-        self.decoder_ln = nn.LayerNorm(D)
-        self.decoder_blocks = nn.ModuleList([
-            MaskedBlock(D, heads, mlp_ratio=mlp_r, init_values=iv, qk_norm=qk)
-            for _ in range(dec_depth)
-        ])
-        self.rgb_head = nn.Sequential(
-            nn.LayerNorm(D),
-            nn.Linear(D, D * 4),
-            nn.GELU(),
-            nn.Linear(D * 4, D),
-            nn.GELU(),
-            nn.Linear(D, ps * ps * 3),
-            nn.Sigmoid(),
-        )
+        # --- latent pose + renderer ---
+        pose_dim = config.model.get("pose_dim", 256)
+        self.pose_post_norm = nn.LayerNorm(D)
+        self.latent_pose_head = LatentPoseHead(D, pose_dim)
+        self.render = LatentRenderer(D, heads, dec_depth, ps, pose_dim)
 
         # --- loss ---
         self.loss_computer = LossComputer(config)
@@ -340,6 +414,9 @@ class Spa3R(nn.Module):
                 p.requires_grad_(False)
 
         self.freeze_backbone = config.model.get("freeze_backbone", True)
+        self._self_decode_prob = config.model.get("self_decode_prob", 0.05)
+        self._full_chance = config.model.get("full_chance", 0.05)
+        self._empty_chance = config.model.get("empty_chance", 0.0)
         if self.freeze_backbone:
             for p in self.patch_embed.parameters():
                 p.requires_grad_(False)
@@ -406,7 +483,7 @@ class Spa3R(nn.Module):
         if self.rope is None:
             return None
         pos = self.position_getter(B, self.h_patches, self.w_patches, device) + 1
-        n_special = 2 + self.num_register_tokens
+        n_special = 2 * self.num_pose_tokens + self.num_register_tokens
         sp = torch.zeros(B, n_special, 2, device=device, dtype=pos.dtype)
         return torch.cat([sp, pos], dim=1)
 
@@ -436,6 +513,10 @@ class Spa3R(nn.Module):
         B, V, _, H, W = imgs.shape
         device = imgs.device
 
+        smask = (torch.rand(B, device=device) <= self._self_decode_prob).float()
+        imgs = imgs.clone()
+        imgs[:, 1] = (1.0 - smask[:, None, None, None]) * imgs[:, 1] + smask[:, None, None, None] * imgs[:, 0]
+
         ctx_img = imgs[:, 0]                       # [B, 3, H, W]
         tgt_img = imgs[:, 1]
 
@@ -445,7 +526,10 @@ class Spa3R(nn.Module):
         N, C = ctx_patches.shape[1], ctx_patches.shape[2]
 
         # 2. quadrant mask
-        pmask = generate_quadrant_mask(B, self.h_patches, self.w_patches, device)  # [B,N] 0=a 1=b
+        pmask, qc = generate_quadrant_mask(
+            B, self.h_patches, self.w_patches, device,
+            self._full_chance, self._empty_chance,
+        )  # [B,N] 0=a 1=b
 
         # 3. special tokens
         cam_ctx  = self.camera_token[:, 0].expand(B, -1, -1)       # [B,1,C]
@@ -462,8 +546,8 @@ class Spa3R(nn.Module):
 
         # 4. visibility levels  (0: ctx, 1: aug_a, 2: aug_b / full)
         tgt_levels = torch.full((B, P_t), 2, dtype=torch.long, device=device)
-        tgt_levels[:, 0] = 1                                       # pose_token_1
-        patch_off = 2 + self.num_register_tokens
+        tgt_levels[:, :self.num_pose_tokens] = 1                   # pose_token_1 group
+        patch_off = 2 * self.num_pose_tokens + self.num_register_tokens
         for b_i in range(B):
             tgt_levels[b_i, patch_off:][pmask[b_i] == 0] = 1       # aug_a patches
 
@@ -505,77 +589,90 @@ class Spa3R(nn.Module):
             ctx_tok, tgt_tok = all_tok.split([P_c, P_t], 1)
 
         # 8. extract features
-        cam_ctx_feat = ctx_tok[:, 0:1]
-        pose1_feat   = tgt_tok[:, 0:1]
+        cam_ctx_feat = ctx_tok[:, :self.num_pose_tokens]
+        pose1_feat   = tgt_tok[:, :self.num_pose_tokens]
+        pose2_feat   = tgt_tok[:, self.num_pose_tokens:2 * self.num_pose_tokens]
         ctx_patch_f  = ctx_tok[:, self.patch_start_idx:]           # [B,N,C]
-        tgt_patch_f  = tgt_tok[:, patch_off:]                      # [B,N,C]
 
-        # 9. pose prediction
-        # pose_token_1: 看到 ctx + aug_a，预测 target pose（主路径）
-        pose_tok_all = torch.cat([cam_ctx_feat, pose1_feat], 1)    # [B,2,C]
-        pose_enc1 = self.pose_predictor(pose_tok_all)[-1]          # [B,2,9]
-        c2w, fxfycxcy = pose_enc_to_c2w_fxfycxcy(pose_enc1, (H, W))
+        # 9. explicit pose head kept only for compatibility / pose eval
+        pose_tok_all = torch.stack([cam_ctx_feat[:, 0], pose1_feat[:, 0]], dim=1)  # [B,2,C]
+        with torch.no_grad():
+            pose_enc1 = self.pose_predictor(pose_tok_all.detach())[-1]      # [B,2,9]
+            c2w, fxfycxcy = pose_enc_to_c2w_fxfycxcy(pose_enc1, (H, W))
 
-        # 10. decoder
-        tgt_c2w     = c2w[1::2]                                   # [B,4,4]
-        tgt_fxfycxcy = fxfycxcy[1::2]
-        ctx_c2w     = c2w[0::2]                                   # [B,4,4]
-        ctx_fxfycxcy = fxfycxcy[0::2]
+        # 10. xfactor-style latent pose conditioning for rendering
+        pose_feats = torch.stack([
+            torch.stack([cam_ctx_feat[:, 0], cam_ctx_feat[:, 0]], dim=1),
+            torch.stack([pose1_feat[:, 0], pose2_feat[:, 0]], dim=1),
+        ], dim=1)  # [B, 2, 2, C]
+        pose_feats = F.gelu(self.pose_post_norm(pose_feats))
+        pose_ref = pose_feats[:, 0:1].expand_as(pose_feats)
+        latent_pose = self.latent_pose_head(pose_feats, pose_ref)  # [B,2,2,Cp]
+        P0, P1 = latent_pose[:, :, 0], latent_pose[:, :, 1]
+        q0 = (qc == 0).float()  # full_chance: target sees all quadrants
+        q1 = (qc == 4).float()  # empty_chance: target sees no quadrants
+        P0n = (1.0 - q1[:, None, None]) * P0 + q1[:, None, None] * P1
+        P1n = (1.0 - q0[:, None, None]) * P1 + q0[:, None, None] * P0
+        latent_pose_swap = torch.stack([P1n, P0n], dim=2)
 
         H_eff = self.h_patches * self.patch_size_val
         W_eff = self.w_patches * self.patch_size_val
+        tgt_img_eff = tgt_img[:, :, :H_eff, :W_eff]
+        pred_full = self.render(
+            ctx_patch_f.unsqueeze(1),
+            ctx_img[:, None, :, :H_eff, :W_eff],
+            latent_pose_swap,
+            pmask,
+        )
 
-        tgt_plucker = cam_to_plucker(tgt_c2w, tgt_fxfycxcy, H_eff, W_eff)
-        plk_tok = self.plucker_tokenizer(tgt_plucker)              # [B,N,C]
-
-        ctx_plucker = cam_to_plucker(ctx_c2w, ctx_fxfycxcy, H_eff, W_eff)
-        ctx_plk_tok = self.plucker_tokenizer(ctx_plucker)          # [B,N,C]
-        ctx_raw_tok = self.raw_rgb_tokenizer(ctx_img[:, :, :H_eff, :W_eff])  # [B,N,C]
-        ctx_fused = self.mlp_fuse(torch.cat([ctx_patch_f, ctx_raw_tok, ctx_plk_tok], dim=-1))
-
-        aug_b_idx = (pmask == 1)                                   # [B,N]
-        n_b = int(aug_b_idx[0].sum().item())
-
-        plk_b   = torch.stack([plk_tok[b][aug_b_idx[b]] for b in range(B)])
-
-        tgt_rgb_patches = rearrange(
-            tgt_img[:, :, :H_eff, :W_eff],
+        pred_rgb_patches = rearrange(
+            pred_full,
             "b c (hh ph) (ww pw) -> b (hh ww) (ph pw c)",
             ph=self.patch_size_val, pw=self.patch_size_val,
         )
-        rgb_gt = torch.stack([tgt_rgb_patches[b][aug_b_idx[b]] for b in range(B)])
+        tgt_rgb_patches = rearrange(
+            tgt_img_eff,
+            "b c (hh ph) (ww pw) -> b (hh ww) (ph pw c)",
+            ph=self.patch_size_val, pw=self.patch_size_val,
+        )
 
-        dec_in = torch.cat([plk_b, ctx_fused], 1)
-        dec_in = self.decoder_ln(dec_in)
-        for blk in self.decoder_blocks:
-            dec_in = torch_checkpoint(blk, dec_in, None, None, use_reentrant=False)
-        dec_b = dec_in[:, :n_b]
-        pred_rgb  = self.rgb_head(dec_b)
+        aug_b_idx = (pmask == 1)                                   # [B,N]
+        valid_counts = aug_b_idx.sum(dim=1)
+        use_masked = valid_counts > 0
 
-        # 11. losses: smooth L1 + LPIPS
+        # 11. losses: masked aug_b supervision when available, full-image fallback for full_chance samples
         smooth_l1_beta = self.config.training.get("smooth_l1_beta", 0.05)
-        smooth_l1 = F.smooth_l1_loss(pred_rgb, rgb_gt, beta=smooth_l1_beta)
-        with torch.no_grad():
-            mse_for_psnr = F.mse_loss(pred_rgb, rgb_gt)
+        pred_rgb_flat = pred_rgb_patches.reshape(B, -1, pred_rgb_patches.shape[-1])
+        tgt_rgb_flat = tgt_rgb_patches.reshape(B, -1, tgt_rgb_patches.shape[-1])
+
+        per_sample_smooth_l1 = []
+        per_sample_mse = []
+        for b in range(B):
+            if use_masked[b]:
+                pred_sel = pred_rgb_flat[b][aug_b_idx[b]]
+                tgt_sel = tgt_rgb_flat[b][aug_b_idx[b]]
+            else:
+                pred_sel = pred_rgb_flat[b]
+                tgt_sel = tgt_rgb_flat[b]
+            per_sample_smooth_l1.append(F.smooth_l1_loss(pred_sel, tgt_sel, beta=smooth_l1_beta))
+            with torch.no_grad():
+                per_sample_mse.append(F.mse_loss(pred_sel, tgt_sel))
+
+        smooth_l1 = torch.stack(per_sample_smooth_l1).mean()
+        mse_for_psnr = torch.stack(per_sample_mse).mean()
         psnr = -10.0 * torch.log10(mse_for_psnr.clamp(min=1e-8))
 
         loss = smooth_l1
         lpips_val = torch.tensor(0.0, device=device)
 
-        # Assemble full predicted image (differentiable for LPIPS, reused for viz)
-        pred_rgb_f = pred_rgb.to(tgt_rgb_patches.dtype)
-        pred_at_b = torch.zeros_like(tgt_rgb_patches)
-        for b_i in range(B):
-            pred_at_b[b_i, aug_b_idx[b_i]] = pred_rgb_f[b_i]
         mask_f = aug_b_idx.unsqueeze(-1).float()
-        assembled = tgt_rgb_patches.detach() * (1 - mask_f) + pred_at_b
+        assembled = tgt_rgb_patches.detach() * (1 - mask_f) + pred_rgb_patches * mask_f
         pred_img = rearrange(
             assembled,
             "b (hh ww) (ph pw c) -> b c (hh ph) (ww pw)",
             hh=self.h_patches, ww=self.w_patches,
             ph=self.patch_size_val, pw=self.patch_size_val, c=3,
         )
-        tgt_img_eff = tgt_img[:, :, :H_eff, :W_eff]
 
         if self._lpips_weight > 0 and hasattr(self, '_train_lpips'):
             lpips_val = self._train_lpips(
@@ -647,42 +744,24 @@ class Spa3R(nn.Module):
 
         # pose
         cam_feats = torch.stack([f[:, 0] for f in ftoks], 1)      # [B,V,C]
-        pose_enc = self.pose_predictor(cam_feats)[-1]              # [B,V,9]
-        c2w, fxfycxcy = pose_enc_to_c2w_fxfycxcy(pose_enc, (H, W))
+        with torch.no_grad():
+            pose_enc = self.pose_predictor(cam_feats.detach())[-1]          # [B,V,9]
+            c2w, fxfycxcy = pose_enc_to_c2w_fxfycxcy(pose_enc, (H, W))
 
-        # context features fused with ctx plucker
+        latent_feats = F.gelu(self.pose_post_norm(cam_feats))
+        latent_ref = latent_feats[:, 0:1].expand_as(latent_feats)
+        latent_pose = self.latent_pose_head(latent_feats, latent_ref)  # [B,V,Cp]
+
         H_eff = self.h_patches * self.patch_size_val
         W_eff = self.w_patches * self.patch_size_val
-        ctx_fused_list = []
-        for v in range(num_in):
-            vc = c2w.view(B, V, 4, 4)[:, v]
-            vf = fxfycxcy.view(B, V, 4)[:, v]
-            ctx_plk = cam_to_plucker(vc, vf, H_eff, W_eff)
-            ctx_plk_tok = self.plucker_tokenizer(ctx_plk)
-            ctx_feat_v = ftoks[v][:, self.patch_start_idx:]
-            ctx_raw_v = self.raw_rgb_tokenizer(imgs[:, v, :, :H_eff, :W_eff])
-            ctx_fused_list.append(
-                self.mlp_fuse(torch.cat([ctx_feat_v, ctx_raw_v, ctx_plk_tok], dim=-1))
-            )
-        ctx_f = torch.cat(ctx_fused_list, 1)                      # [B, num_in*N, C]
+        ctx_feat = torch.stack([ftoks[v][:, self.patch_start_idx:] for v in range(num_in)], dim=1)
+        x_ctx = imgs[:, :num_in, :, :H_eff, :W_eff]
 
         # render targets
         rendered = []
         for tv in range(num_in, V):
-            tc = c2w.view(B, V, 4, 4)[:, tv]
-            tf = fxfycxcy.view(B, V, 4)[:, tv]
-            plk = cam_to_plucker(tc, tf, H_eff, W_eff)
-            pt = self.plucker_tokenizer(plk)
-            d = torch.cat([pt, ctx_f], 1)
-            d = self.decoder_ln(d)
-            for blk in self.decoder_blocks:
-                d = blk(d)
-            rgb = self.rgb_head(d[:, :self.n_patches])
-            img = rearrange(
-                rgb, "b (hh ww) (ph pw c) -> b c (hh ph) (ww pw)",
-                hh=self.h_patches, ww=self.w_patches,
-                ph=self.patch_size_val, pw=self.patch_size_val, c=3,
-            )
+            P_v = torch.cat([latent_pose[:, :num_in], latent_pose[:, tv:tv + 1]], dim=1)
+            img = self.render(ctx_feat, x_ctx, P_v, pmask=None)
             rendered.append(img)
 
         rendered = torch.stack(rendered, 1)                        # [B, V_t, 3, H', W']
@@ -736,8 +815,6 @@ class Spa3R(nn.Module):
             frame_blocks=c(self.frame_blocks),
             global_blocks=c(self.global_blocks),
             pose_predictor=c(self.pose_predictor),
-            raw_rgb_tokenizer=c(self.raw_rgb_tokenizer),
-            mlp_fuse=c(self.mlp_fuse),
-            decoder=c(self.decoder_blocks),
-            rgb_head=c(self.rgb_head),
+            latent_pose_head=c(self.latent_pose_head),
+            render=c(self.render),
         )

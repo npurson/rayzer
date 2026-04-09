@@ -1,24 +1,32 @@
 model:
-  class_name: model.xfactor.XFactor
-  embed_dim: 1024
-  num_heads: 16
-  aggregator_depth: 8
-  decoder_depth: 8
-  patch_size: 16
-  image_size: 256
-  pose_dim: 256
-  num_pose_tokens: 32
+  class_name: model.rayzer_xf.RayZer_XF
   self_decode_prob: 0.05
   full_chance: 0.05
+  empty_chance: 0.0
   image_tokenizer:
     image_size: 256
-    patch_size: 16
+    patch_size: 16    # use 8 if you have enough compute
     in_channels: 3
+  input_with_pe: true
   target_image:
     height: 256
     width: 256
-    patch_size: 16
+    patch_size: 16    # use 8 if you have enough compute
     in_channels: 6
+  transformer:
+    d: 768
+    d_head: 64
+    encoder_n_layer: 8
+    encoder_geom_n_layer: 12
+    decoder_n_layer: 12
+    special_init: true
+    depth_init: true
+    use_qk_norm: true
+  scene_latent:
+    length: 3072
+  pose_latent:
+    length: 1
+    canonical: middle   # use middle frame as reference frame
 
 training:
   amp_dtype: bf16
@@ -29,7 +37,7 @@ training:
   allowed_gradnorm_factor: 2.0
   center_crop: true
   scene_scale_factor: 1.35
-  checkpoint_dir: ./experiments/checkpoints/xfactor_dl3dv_eval
+  checkpoint_dir: ./experiments/checkpoints/rayzer_xf_dl3dv_eval
   checkpoint_every: 2000
   dataset_name: data.dataset_scene.Dataset
   dataset_path: data/dl3dv_benchmark.txt
@@ -39,23 +47,26 @@ training:
 
   l2_loss_weight: 1.0
   lpips_loss_weight: 0.0
-  perceptual_loss_weight: 0.0
-  pose_augmentation: false
+  perceptual_loss_weight: 0.2
+  smooth_l1_beta: 0.05
 
   lr: 0.0004
   train_steps: 100000
   no_pass_steps: 100
 
-  num_views: 2
-  num_input_views: 1
-  num_target_views: 1
+  num_views: 24
+  num_input_views: 16
+  num_target_views: 8
   target_has_input: false
-  random_split: false
-  view_selector:
+  random_split: true
+  view_selector:  # dl3dv
     type: two_frame
-    min_frame_dist: 12
-    max_frame_dist: 24
+    min_frame_dist: 64
+    max_frame_dist: 96
     use_curriculum: false
+    curriculum_iter: 30000
+    curriculum_start_min_frame_dist: 48
+    curriculum_start_max_frame_dist: 64
   num_threads: 8
   num_workers: 4
   prefetch_factor: 8
@@ -67,19 +78,20 @@ training:
   use_tf32: true
   vis_every: 1000
 
-  wandb_project: xfactor
-  wandb_exp_name: xfactor_dl3dv_eval
+  wandb_project: rayzer
+  wandb_exp_name: rayzer_xf_dl3dv_eval
   wandb_log_every: 50
 
-  warmup: 4000
-  weight_decay: 0.005
+  warmup: 3000
+  weight_decay: 0.05
 
   render_video: render_video
 
+# inference / evaluation (enabled for evaluation)
 inference:
   if_inference: True
-  compute_metrics: True
   compute_tps: True
+  compute_metrics: True
   view_idx_file_path: ./data/rayzer_evaluation_index_dl3dv_even.json
   render_video: False
   render_video_config:

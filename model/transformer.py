@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
 try:
@@ -154,14 +155,29 @@ class QK_Norm_SelfAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        x = xops.memory_efficient_attention(
-            q,
-            k,
-            v,
-            attn_bias=attn_bias,
-            p=self.attn_dropout if self.training else 0.0,
-            op=(xops.fmha.flash.FwOp, xops.fmha.flash.BwOp),
-        )
+        if isinstance(attn_bias, torch.Tensor):
+            # xFormers flash attention does not accept dense Tensor attention bias.
+            # Fall back to PyTorch SDPA when grouped/additive masks are provided.
+            q_sdpa = q.permute(0, 2, 1, 3)  # [B, H, L, Dh]
+            k_sdpa = k.permute(0, 2, 1, 3)
+            v_sdpa = v.permute(0, 2, 1, 3)
+            x = F.scaled_dot_product_attention(
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
+                attn_mask=attn_bias,
+                dropout_p=self.attn_dropout if self.training else 0.0,
+            )
+            x = x.permute(0, 2, 1, 3)  # [B, L, H, Dh]
+        else:
+            x = xops.memory_efficient_attention(
+                q,
+                k,
+                v,
+                attn_bias=attn_bias,
+                p=self.attn_dropout if self.training else 0.0,
+                op=(xops.fmha.flash.FwOp, xops.fmha.flash.BwOp),
+            )
 
         x = rearrange(x, "b l nh dh -> b l (nh dh)")
         x = self.attn_fc_dropout(self.fc(x))
@@ -325,7 +341,7 @@ class QK_Norm_TransformerBlock(nn.Module):
             dropout=mlp_dropout,
         )
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x, attn_bias=None):
+        x = x + self.attn(self.norm1(x), attn_bias=attn_bias)
         x = x + self.mlp(self.norm2(x))
         return x

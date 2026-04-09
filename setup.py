@@ -82,11 +82,37 @@ def init_distributed(seed=42):
             - is_main_process: Flag to identify the main process
             - seed: The random seed used for this process
     """
-    global_rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
 
-    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=3600))
+    # Multi-node on platforms without TCP between pods: use shared FileStore
+    # (set by cluster start_train.sh: FILESTORE_PATH, MULTI_NODE_RANK, MULTI_NNODES, NPROC_PER_NODE)
+    # and torchrun --standalone (LOCAL_RANK/RANK per node are local only).
+    filestore_path = os.environ.get("FILESTORE_PATH")
+    if filestore_path:
+        node_rank = int(os.environ["MULTI_NODE_RANK"])
+        nnodes = int(os.environ["MULTI_NNODES"])
+        nproc = int(os.environ["NPROC_PER_NODE"])
+        global_rank = node_rank * nproc + local_rank
+        world_size = nnodes * nproc
+        store = dist.FileStore(filestore_path, world_size)
+        dist.init_process_group(
+            backend="nccl",
+            store=store,
+            rank=global_rank,
+            world_size=world_size,
+            timeout=datetime.timedelta(seconds=3600),
+        )
+        if global_rank == 0:
+            print(
+                f"[init_distributed] FileStore path={filestore_path} "
+                f"global_rank={global_rank}/{world_size} local_rank={local_rank}"
+            )
+    else:
+        global_rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        dist.init_process_group(
+            backend="nccl", timeout=datetime.timedelta(seconds=3600)
+        )
 
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)

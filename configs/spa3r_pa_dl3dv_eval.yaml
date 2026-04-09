@@ -1,23 +1,30 @@
 model:
-  class_name: model.xfactor.XFactor
-  embed_dim: 1024
-  num_heads: 16
-  aggregator_depth: 8
-  decoder_depth: 8
-  patch_size: 16
-  image_size: 256
-  pose_dim: 256
-  num_pose_tokens: 32
-  self_decode_prob: 0.05
-  full_chance: 0.05
+  class_name: model.spa3r_pa.Spa3RPA
+  embed_dim: 768
+  num_heads: 12
+  aggregator_depth: 12
+  decoder_depth: 12
+  patch_size: 14
+  image_size: 336
+  num_register_tokens: 4
+  mlp_ratio: 4.0
+  init_values: 0.01
+  qk_norm: true
+  rope_freq: 100
+  patch_embed: dinov2_vitb14_reg
+  backbone_pretrained: null
+  freeze_backbone: true
+  use_vggt_teacher: false
+  vggt_teacher_image_size: 518
+  pose_head_depth: 4
   image_tokenizer:
-    image_size: 256
-    patch_size: 16
+    image_size: 336
+    patch_size: 14
     in_channels: 3
   target_image:
-    height: 256
-    width: 256
-    patch_size: 16
+    height: 336
+    width: 336
+    patch_size: 14
     in_channels: 6
 
 training:
@@ -29,7 +36,7 @@ training:
   allowed_gradnorm_factor: 2.0
   center_crop: true
   scene_scale_factor: 1.35
-  checkpoint_dir: ./experiments/checkpoints/xfactor_dl3dv_eval
+  checkpoint_dir: ./experiments/checkpoints/spa3r_pa_dl3dv_eval
   checkpoint_every: 2000
   dataset_name: data.dataset_scene.Dataset
   dataset_path: data/dl3dv_benchmark.txt
@@ -40,7 +47,9 @@ training:
   l2_loss_weight: 1.0
   lpips_loss_weight: 0.0
   perceptual_loss_weight: 0.0
-  pose_augmentation: false
+  feature_loss_weight: 1.0
+  pose_align_loss_weight: 1.0
+  pose_align_teacher_stage_ratio: 0.5
 
   lr: 0.0004
   train_steps: 100000
@@ -53,8 +62,8 @@ training:
   random_split: false
   view_selector:
     type: two_frame
-    min_frame_dist: 12
-    max_frame_dist: 24
+    min_frame_dist: 16
+    max_frame_dist: 48
     use_curriculum: false
   num_threads: 8
   num_workers: 4
@@ -67,12 +76,12 @@ training:
   use_tf32: true
   vis_every: 1000
 
-  wandb_project: xfactor
-  wandb_exp_name: xfactor_dl3dv_eval
+  wandb_project: spa3r_pa
+  wandb_exp_name: spa3r_pa_dl3dv_eval
   wandb_log_every: 50
 
-  warmup: 4000
-  weight_decay: 0.005
+  warmup: 3000
+  weight_decay: 0.05
 
   render_video: render_video
 

@@ -16,6 +16,8 @@ from vggt.layers.patch_embed import PatchEmbed
 from vggt.layers.mlp import Mlp
 from vggt.layers.layer_scale import LayerScale
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from vggt.models.vggt import VGGT
+from vggt.utils.rotation import quat_to_mat
 from utils.pose_utils import rot6d2mat
 
 from .loss import LossComputer
@@ -216,6 +218,34 @@ def pose_enc_to_c2w_fxfycxcy(pose_enc, image_hw):
     return c2w, fxfycxcy
 
 
+def vggt_pose_enc_to_c2w_fxfycxcy(pose_enc, image_hw):
+    """VGGT pose_enc [B,S,9] -> c2w [B*S,4,4], fxfycxcy [B*S,4] (normalised)."""
+    B, S, _ = pose_enc.shape
+    p = pose_enc.reshape(B * S, 9)
+    T = p[:, :3]
+    quat = F.normalize(p[:, 3:7], dim=-1)
+    fov_h = p[:, 7].clamp(min=0.1, max=3.0)
+    fov_w = p[:, 8].clamp(min=0.1, max=3.0)
+
+    R = quat_to_mat(quat)                        # [B*S, 3, 3] (w2c)
+    R_t = R.transpose(1, 2)                      # [B*S, 3, 3]
+    t_c = -torch.bmm(R_t, T.unsqueeze(-1))       # [B*S, 3, 1]
+
+    Rt_c2w = torch.cat([R_t, t_c], dim=-1)       # [B*S, 3, 4]
+    bottom = torch.tensor([[0, 0, 0, 1]], dtype=p.dtype, device=p.device
+                          ).expand(B * S, -1, -1)
+    c2w = torch.cat([Rt_c2w, bottom], dim=1)
+
+    H, W = image_hw
+    fy = (H / 2.0) / torch.tan(fov_h / 2.0)
+    fx = (W / 2.0) / torch.tan(fov_w / 2.0)
+    fxfycxcy = torch.stack([
+        fx / W, fy / H,
+        torch.full_like(fx, 0.5), torch.full_like(fy, 0.5),
+    ], dim=-1)
+    return c2w, fxfycxcy
+
+
 def _hierarchical_mask(levels, device):
     """levels [N] int -> [N,N] bool; mask[i,j] = level[j] <= level[i]."""
     return levels.unsqueeze(0) <= levels.unsqueeze(1)
@@ -225,7 +255,7 @@ def _hierarchical_mask(levels, device):
 # Spa3R main model
 # ---------------------------------------------------------------------------
 
-class Spa3R(nn.Module):
+class Spa3RPA(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -316,11 +346,16 @@ class Spa3R(nn.Module):
         # --- loss ---
         self.loss_computer = LossComputer(config)
         self._lpips_weight = config.training.get("lpips_loss_weight", 0.1)
+        self._pose_align_weight = config.training.get("pose_align_loss_weight", 1.0)
+        self._teacher_stage_ratio = config.training.get("pose_align_teacher_stage_ratio", 0.5)
+        self._total_train_steps = max(1, int(config.training.get("train_steps", 1)))
+        self.register_buffer("_train_forward_count", torch.zeros(1, dtype=torch.long), persistent=False)
         if self._lpips_weight > 0 and lpips_lib is not None:
             self._train_lpips = lpips_lib.LPIPS(net="vgg")
             self._train_lpips.eval()
             for p in self._train_lpips.parameters():
                 p.requires_grad_(False)
+        self._build_vggt_teacher(config)
 
         self.freeze_backbone = config.model.get("freeze_backbone", True)
         if self.freeze_backbone:
@@ -328,6 +363,34 @@ class Spa3R(nn.Module):
                 p.requires_grad_(False)
 
         self.config_bk = copy.deepcopy(config)
+
+    def _build_vggt_teacher(self, config):
+        self.vggt_teacher = None
+        if not config.model.get("use_vggt_teacher", True):
+            return
+
+        ckpt_path = config.model.get("vggt_teacher_ckpt", "facebook/VGGT-1B")
+        teacher = VGGT(
+            img_size=config.model.get("vggt_teacher_image_size", 518),
+            enable_point=False,
+            enable_depth=False,
+            enable_track=False,
+        )
+
+        if ckpt_path == "facebook/VGGT-1B":
+            state_dict = torch.hub.load_state_dict_from_url(
+                "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt",
+                map_location="cpu",
+            )
+        else:
+            state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+            if "model" in state_dict:
+                state_dict = state_dict["model"]
+        teacher.load_state_dict(state_dict, strict=False)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        self.vggt_teacher = teacher
 
     # ---- backbone builder ----
     def _build_patch_embed(self, config, n_reg):
@@ -375,6 +438,8 @@ class Spa3R(nn.Module):
         self.loss_computer.eval()
         if hasattr(self, '_train_lpips'):
             self._train_lpips.eval()
+        if self.vggt_teacher is not None:
+            self.vggt_teacher.eval()
 
     # ---- helpers ----
     def _get_pos(self, BS, device):
@@ -405,16 +470,47 @@ class Spa3R(nn.Module):
             tok = tok["x_norm_patchtokens"]
         return tok
 
+    def _resolve_train_iter(self, iter_idx):
+        if isinstance(iter_idx, int) and iter_idx > 0:
+            return iter_idx
+        self._train_forward_count.add_(1)
+        return int(self._train_forward_count.item())
+
+    def _teacher_is_active(self, train_iter):
+        cutoff = int(self._total_train_steps * self._teacher_stage_ratio)
+        cutoff = max(1, cutoff)
+        return train_iter <= cutoff and (self.vggt_teacher is not None)
+
+    @torch.no_grad()
+    def _predict_vggt_pose(self, imgs):
+        # imgs: [B,2,3,H,W], values in [0,1]
+        if self.vggt_teacher is None:
+            return None, None
+        tgt_hw = int(self.config.model.get("vggt_teacher_image_size", 518))
+        imgs_r = F.interpolate(
+            imgs.reshape(-1, 3, imgs.shape[-2], imgs.shape[-1]),
+            size=(tgt_hw, tgt_hw),
+            mode="bicubic",
+            align_corners=False,
+        ).reshape(imgs.shape[0], imgs.shape[1], 3, tgt_hw, tgt_hw)
+        if imgs.device.type == "cuda":
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred = self.vggt_teacher(imgs_r.float())
+        else:
+            pred = self.vggt_teacher(imgs_r.float())
+        pose_enc = pred["pose_enc"].float()  # [B,2,9]
+        return vggt_pose_enc_to_c2w_fxfycxcy(pose_enc, (imgs.shape[-2], imgs.shape[-1]))
+
     # ---- forward dispatch ----
     def forward(self, data, create_visual=False, render_video=False, iter=0):
         if self.training:
-            return self._forward_train(data, create_visual=create_visual)
+            return self._forward_train(data, create_visual=create_visual, iter=iter)
         return self._forward_inference(data, create_visual)
 
     # ================================================================
     #  TRAINING FORWARD
     # ================================================================
-    def _forward_train(self, data, create_visual=False):
+    def _forward_train(self, data, create_visual=False, iter=0):
         imgs = data["image"]                       # [B, 2, 3, H, W]
         B, V, _, H, W = imgs.shape
         device = imgs.device
@@ -494,16 +590,32 @@ class Spa3R(nn.Module):
         tgt_patch_f  = tgt_tok[:, patch_off:]                      # [B,N,C]
 
         # 9. pose prediction
-        # pose_token_1: 看到 ctx + aug_a，预测 target pose（主路径）
         pose_tok_all = torch.cat([cam_ctx_feat, pose1_feat], 1)    # [B,2,C]
-        pose_enc1 = self.pose_predictor(pose_tok_all)[-1]          # [B,2,9]
-        c2w, fxfycxcy = pose_enc_to_c2w_fxfycxcy(pose_enc1, (H, W))
+        pose_enc_pred = self.pose_predictor(pose_tok_all)[-1]      # [B,2,13]
+        pred_c2w, pred_fxfycxcy = pose_enc_to_c2w_fxfycxcy(pose_enc_pred, (H, W))
+
+        train_iter = self._resolve_train_iter(iter)
+        teacher_active = self._teacher_is_active(train_iter)
+        teacher_c2w, teacher_fxfycxcy = self._predict_vggt_pose(imgs) if teacher_active else (None, None)
+
+        if teacher_active and teacher_c2w is not None:
+            # 前半程: decoder 使用 teacher pose，主干 pose 通过对齐损失学习稳定几何。
+            dec_c2w = teacher_c2w
+            dec_fxfycxcy = teacher_fxfycxcy
+            pose_align_c2w = F.smooth_l1_loss(pred_c2w[:, :3, :], teacher_c2w[:, :3, :])
+            pose_align_k = F.smooth_l1_loss(pred_fxfycxcy, teacher_fxfycxcy)
+            pose_align_loss = pose_align_c2w + 0.1 * pose_align_k
+        else:
+            # 后半程: 完全切回模型自预测 pose。
+            dec_c2w = pred_c2w
+            dec_fxfycxcy = pred_fxfycxcy
+            pose_align_loss = torch.tensor(0.0, device=device)
 
         # 10. decoder
-        tgt_c2w     = c2w[1::2]                                   # [B,4,4]
-        tgt_fxfycxcy = fxfycxcy[1::2]
-        ctx_c2w     = c2w[0::2]                                   # [B,4,4]
-        ctx_fxfycxcy = fxfycxcy[0::2]
+        tgt_c2w = dec_c2w[1::2]                                    # [B,4,4]
+        tgt_fxfycxcy = dec_fxfycxcy[1::2]
+        ctx_c2w = dec_c2w[0::2]                                    # [B,4,4]
+        ctx_fxfycxcy = dec_fxfycxcy[0::2]
 
         H_eff = self.h_patches * self.patch_size_val
         W_eff = self.w_patches * self.patch_size_val
@@ -542,7 +654,7 @@ class Spa3R(nn.Module):
             mse_for_psnr = F.mse_loss(pred_rgb, rgb_gt)
         psnr = -10.0 * torch.log10(mse_for_psnr.clamp(min=1e-8))
 
-        loss = smooth_l1
+        loss = smooth_l1 + self._pose_align_weight * pose_align_loss
         lpips_val = torch.tensor(0.0, device=device)
 
         # Assemble full predicted image (differentiable for LPIPS, reused for viz)
@@ -571,9 +683,11 @@ class Spa3R(nn.Module):
             loss_metrics=edict(
                 loss=loss, smooth_l1_loss=smooth_l1,
                 lpips_loss=lpips_val, psnr=psnr,
+                pose_align_loss=pose_align_loss,
+                teacher_pose_active=torch.tensor(float(teacher_active), device=device),
             ),
-            c2w=c2w.view(B, 2, 4, 4),
-            fxfycxcy=fxfycxcy.view(B, 2, 4),
+            c2w=pred_c2w.view(B, 2, 4, 4),
+            fxfycxcy=pred_fxfycxcy.view(B, 2, 4),
         )
 
         if create_visual:
@@ -719,8 +833,13 @@ class Spa3R(nn.Module):
             frame_blocks=c(self.frame_blocks),
             global_blocks=c(self.global_blocks),
             pose_predictor=c(self.pose_predictor),
+            vggt_teacher=0 if self.vggt_teacher is None else c(self.vggt_teacher),
             raw_rgb_tokenizer=c(self.raw_rgb_tokenizer),
             mlp_fuse=c(self.mlp_fuse),
             decoder=c(self.decoder_blocks),
             rgb_head=c(self.rgb_head),
         )
+
+
+# Backward-compatible alias for config entries that still use `Spa3R`.
+Spa3R = Spa3RPA

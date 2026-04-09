@@ -89,6 +89,28 @@ def _init_linear(layer, small_init=False, has_bias=True):
         nn.init.normal_(layer.bias, std=1e-6)
 
 
+def _tensor_debug_stats(x):
+    if not torch.is_tensor(x):
+        return str(type(x))
+    with torch.no_grad():
+        xf = x.detach().float()
+        finite = torch.isfinite(xf)
+        if finite.any():
+            vals = xf[finite]
+            return (
+                f"shape={tuple(x.shape)}, dtype={x.dtype}, "
+                f"min={vals.min().item():.6g}, max={vals.max().item():.6g}, "
+                f"mean={vals.mean().item():.6g}, finite={finite.all().item()}"
+            )
+        return f"shape={tuple(x.shape)}, dtype={x.dtype}, finite=False"
+
+
+def _check_finite_tensor(x, name, enabled=False):
+    if enabled and torch.is_tensor(x) and not torch.isfinite(x).all():
+        raise RuntimeError(f"Non-finite tensor at {name}: {_tensor_debug_stats(x)}")
+    return x
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Rotary position embedding (2-D sincos)
 # ──────────────────────────────────────────────────────────────────────
@@ -136,12 +158,9 @@ def _apply_rope(x, sincos):
 
 def _segment_mask(seg_ids):
     """seg_ids: (B, N) -> bool mask (B, 1, N, N)  True = attend."""
-    # PyTorch `scaled_dot_product_attention` uses bool masks where `True`
-    # means "masked / not allowed to attend".
-    #
-    # We want "only attend within the same segment id", so we mask
-    # cross-segment pairs.
-    return (seg_ids.unsqueeze(-1) != seg_ids.unsqueeze(-2)).unsqueeze(1)
+    # `scaled_dot_product_attention` expects boolean masks where True means
+    # the query/key pair participates in attention.
+    return (seg_ids.unsqueeze(-1) == seg_ids.unsqueeze(-2)).unsqueeze(1)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -155,6 +174,8 @@ class _MVLayer(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.debug_numerics = False
+        self.debug_name = self.__class__.__name__
 
         self.norm1 = nn.LayerNorm(dim, bias=False)
 
@@ -194,11 +215,17 @@ class _MVLayer(nn.Module):
 
         # ---- pre-norm + QKV ----
         x_n = self.norm1(x)
+        _check_finite_tensor(x_n, f"{self.debug_name}.norm1", self.debug_numerics)
         qkv = self.qkv(x_n).reshape(B, V, T, 6, H, D)
+        _check_finite_tensor(qkv, f"{self.debug_name}.qkv", self.debug_numerics)
         q, k, v, qs, ks, vs = qkv.unbind(3)  # each (B,V,T,H,D)
 
         q, k = self.q_norm(q), self.k_norm(k)
         qs, ks = self.qs_norm(qs), self.ks_norm(ks)
+        _check_finite_tensor(q, f"{self.debug_name}.q", self.debug_numerics)
+        _check_finite_tensor(k, f"{self.debug_name}.k", self.debug_numerics)
+        _check_finite_tensor(qs, f"{self.debug_name}.qs", self.debug_numerics)
+        _check_finite_tensor(ks, f"{self.debug_name}.ks", self.debug_numerics)
 
         if sincos_rope is not None:
             q = _apply_rope(q, sincos_rope)
@@ -213,6 +240,7 @@ class _MVLayer(nn.Module):
         g_mask = _segment_mask(seg_ids.reshape(B, V * T))   # (B, 1, VT, VT)
         x_g = F.scaled_dot_product_attention(q_g, k_g, v_g, attn_mask=g_mask)
         x_g = x_g.transpose(1, 2).reshape(B, V, T, C)
+        _check_finite_tensor(x_g, f"{self.debug_name}.global_attn", self.debug_numerics)
 
         # ---- self (per-view) attention ----
         qs_f = qs.reshape(B * V, T, H, D).transpose(1, 2)  # (BV, H, T, D)
@@ -221,14 +249,18 @@ class _MVLayer(nn.Module):
         s_mask = _segment_mask(seg_ids.reshape(B * V, T))    # (BV, 1, T, T)
         x_s = F.scaled_dot_product_attention(qs_f, ks_f, vs_f, attn_mask=s_mask)
         x_s = x_s.transpose(1, 2).reshape(B, V, T, C)
+        _check_finite_tensor(x_s, f"{self.debug_name}.self_attn", self.debug_numerics)
 
         # ---- merge + residual ----
         x0 = self.out_proj(torch.cat([x_g, x_s], dim=-1))
         x0 = self.ls1(x0) + x
+        _check_finite_tensor(x0, f"{self.debug_name}.residual1", self.debug_numerics)
 
         # ---- FFN (LN -> GELU -> MLP -> LayerScale -> residual) ----
         x1 = self.ffn(F.gelu(self.norm2(x0)))
-        return self.ls2(x1) + x0
+        out = self.ls2(x1) + x0
+        _check_finite_tensor(out, f"{self.debug_name}.residual2", self.debug_numerics)
+        return out
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -269,6 +301,10 @@ class _PoseEncoder(nn.Module):
         self.layers = nn.ModuleList(
             [_MVLayer(dim, num_heads) for _ in range(num_layers)]
         )
+        for i, layer in enumerate(self.layers):
+            layer.debug_name = f"render.layers.{i}"
+        for i, layer in enumerate(self.layers):
+            layer.debug_name = f"pose_enc.layers.{i}"
         self.use_checkpoint = use_checkpoint
 
         self.post_norm = nn.LayerNorm(dim)
@@ -409,16 +445,24 @@ class _Renderer(nn.Module):
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _quadrant_mask(B, Hp, Wp, device, full_chance=0.05):
+def _quadrant_mask(B, Hp, Wp, device, full_chance=0.05, empty_chance=0.0):
     """Returns ``(pmask, qc)`` where pmask is ``(B, N)`` in {0,1}
     and qc is ``(B,)`` = sum of the 4 quadrant labels."""
     assert Hp % 2 == 0 and Wp % 2 == 0
+    if full_chance < 0.0 or empty_chance < 0.0 or full_chance + empty_chance > 1.0:
+        raise ValueError(
+            f"Expected 0 <= full_chance + empty_chance <= 1, got "
+            f"full_chance={full_chance}, empty_chance={empty_chance}"
+        )
     H2, W2 = Hp // 2, Wp // 2
 
     q = torch.zeros(B, 4, dtype=torch.long, device=device)
     q[:, :2] = 1  # two ones, two zeros
-    full = torch.rand(B, device=device) <= full_chance
+    mask_mode = torch.rand(B, device=device)
+    full = mask_mode <= full_chance
+    empty = (mask_mode > full_chance) & (mask_mode <= full_chance + empty_chance)
     q[full] = 0  # 5 % chance all zeros
+    q[empty] = 1
     for i in range(B):
         q[i] = q[i, torch.randperm(4, device=device)]
 
@@ -544,7 +588,13 @@ class XFactor(nn.Module):
         # ---- training knobs ----
         self._self_decode_prob = m.get("self_decode_prob", 0.05)
         self._full_chance = m.get("full_chance", 0.05)
+        self._empty_chance = m.get("empty_chance", 0.0)
         self._pose_aug = config.training.get("pose_augmentation", True)
+        self._debug_numerics = config.training.get("debug_numerics", False)
+        for layer in self.pose_enc.layers:
+            layer.debug_numerics = self._debug_numerics
+        for layer in self.render.layers:
+            layer.debug_numerics = self._debug_numerics
 
         self.config_bk = copy.deepcopy(config)
 
@@ -574,6 +624,7 @@ class XFactor(nn.Module):
 
         # normalise to [-1, 1]
         x = imgs * 2.0 - 1.0
+        _check_finite_tensor(x, "train.input_x", self._debug_numerics)
 
         # ---- self-decode trick: small chance to decode reference ----
         smask = (torch.rand(B, device=device) <= self._self_decode_prob).float()
@@ -583,7 +634,8 @@ class XFactor(nn.Module):
 
         # ---- quadrant mask ----
         pmask, qc = _quadrant_mask(
-            B, self.h_patches, self.w_patches, device, self._full_chance,
+            B, self.h_patches, self.w_patches, device,
+            self._full_chance, self._empty_chance,
         )
 
         # ---- pose encoder (optionally augmented input) ----
@@ -591,32 +643,42 @@ class XFactor(nn.Module):
             x_enc = _pose_augment(x)
         else:
             x_enc = x
+        _check_finite_tensor(x_enc, "train.x_enc", self._debug_numerics)
         P = self.pose_enc(x_enc, pmask)  # (B, V, 2, pose_dim)
+        _check_finite_tensor(P, "train.pose", self._debug_numerics)
 
         # ---- pose swap for transferability ----
         P0, P1 = P[:, :, 0], P[:, :, 1]  # each (B, V, Cp)
         q0 = (qc == 0).float()  # True when mask is all-zero (full_chance)
-        q1 = (qc == 4).float()  # never True with 2+2 scheme
+        q1 = (qc == 4).float()  # True when all quadrants are masked (empty_chance)
 
         P0n = (1.0 - q1[:, None, None]) * P0 + q1[:, None, None] * P1
         P1n = (1.0 - q0[:, None, None]) * P1 + q0[:, None, None] * P0
         P_swap = torch.stack([P1n, P0n], dim=2)  # (B, V, 2, Cp)
+        _check_finite_tensor(P_swap, "train.pose_swap", self._debug_numerics)
 
         # ---- render ----
         pred = self.render(x[:, :-1], P_swap, pmask)  # (B, 3, H, W) in [-1, 1]
         gt = x[:, -1]  # (B, 3, H, W)
+        _check_finite_tensor(pred, "train.pred", self._debug_numerics)
+        _check_finite_tensor(gt, "train.gt", self._debug_numerics)
 
         # ---- losses (in [-1, 1]) ----
         l1 = F.l1_loss(pred, gt)
+        _check_finite_tensor(l1, "train.l1", self._debug_numerics)
         lpips_val = torch.tensor(0.0, device=device)
         if self._lpips_w > 0 and hasattr(self, "_lpips"):
             lpips_val = self._lpips(pred.float(), gt.float()).mean()
+        _check_finite_tensor(lpips_val, "train.lpips", self._debug_numerics)
         loss = l1 + self._lpips_w * lpips_val
+        _check_finite_tensor(loss, "train.loss", self._debug_numerics)
 
         # PSNR in [0, 1] space
         with torch.no_grad():
             mse01 = F.mse_loss((pred + 1) / 2, (gt + 1) / 2)
+            _check_finite_tensor(mse01, "train.mse01", self._debug_numerics)
             psnr = -10.0 * torch.log10(mse01.clamp(min=1e-8))
+            _check_finite_tensor(psnr, "train.psnr", self._debug_numerics)
 
         ret = edict(
             loss_metrics=edict(loss=loss, l1_loss=l1, lpips_loss=lpips_val, psnr=psnr),

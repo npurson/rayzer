@@ -182,24 +182,26 @@ while cur_train_step <= total_train_steps:
     )
     render_video = create_visual and config.training.get("render_video", False)
 
-    with torch.autocast(
-        enabled=config.training.use_amp,
-        device_type="cuda",
-        dtype=amp_dtype_mapping[config.training.amp_dtype],
-    ):
-        if "LVSM" in config.model.class_name:
-            ret_dict = model(batch)
-        elif any(
-            k in config.model.class_name
-            for k in ("rayzer", "erayzer", "spa3r", "xfactor")
+    detect_anomaly = config.training.get("detect_anomaly", False)
+    with torch.autograd.set_detect_anomaly(detect_anomaly):
+        with torch.autocast(
+            enabled=config.training.use_amp,
+            device_type="cuda",
+            dtype=amp_dtype_mapping[config.training.amp_dtype],
         ):
-            ret_dict = model(
-                batch, create_visual=create_visual, render_video=render_video
-            )
-        else:
-            raise NotImplementedError(
-                f"Model {config.model.class_name} is not supported"
-            )
+            if "LVSM" in config.model.class_name:
+                ret_dict = model(batch)
+            elif any(
+                k in config.model.class_name
+                for k in ("rayzer", "erayzer", "spa3r", "xfactor")
+            ):
+                ret_dict = model(
+                    batch, create_visual=create_visual, render_video=render_video
+                )
+            else:
+                raise NotImplementedError(
+                    f"Model {config.model.class_name} is not supported"
+                )
 
     # Backward pass
     update_grads = (
@@ -244,6 +246,17 @@ while cur_train_step <= total_train_steps:
         if not skip_optimizer_step:
             # Unscales the gradients
             scaler.unscale_(optimizer)
+            debug_grads = config.training.get("debug_grad_nonfinite", False)
+            if debug_grads and ddp_info.is_main_process:
+                bad_grad_names = []
+                for n, p in optimized_param_dict.items():
+                    if p.requires_grad and (p.grad is not None) and (not torch.isfinite(p.grad).all()):
+                        bad_grad_names.append(n)
+                if bad_grad_names:
+                    print("Non-finite gradients before nan_to_num:")
+                    for name in bad_grad_names[:50]:
+                        g = optimized_param_dict[name].grad
+                        print(f"  {name}: min={torch.nan_to_num(g).min().item():.6g}, max={torch.nan_to_num(g).max().item():.6g}")
             # For all gradients, we safely change the NaN -> 0., inf -> 1e-6, -inf -> 1e-6.
             with torch.no_grad():
                 for n, p in optimized_param_dict.items():
@@ -278,17 +291,17 @@ while cur_train_step <= total_train_steps:
                     "allowed_gradnorm_factor", 5
                 )
 
-                if total_grad_norm > config.training.grad_clip_norm * 2.0:
-                    print(
-                        f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {config.training.grad_clip_norm * 2.0}"
-                    )
-                if (total_grad_norm > allowed_gradnorm) and (
-                    cur_train_step > config.training.get("no_pass_steps", -1)
-                ):
-                    skip_optimizer_step = True
-                    print(
-                        f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {allowed_gradnorm}, skipping optimizer step"
-                    )
+                # if total_grad_norm > config.training.grad_clip_norm * 2.0:
+                #     print(
+                #         f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {config.training.grad_clip_norm * 2.0}"
+                #     )
+                # if (total_grad_norm > allowed_gradnorm) and (
+                #     cur_train_step > config.training.get("no_pass_steps", -1)
+                # ):
+                #     skip_optimizer_step = True
+                #     print(
+                #         f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {allowed_gradnorm}, skipping optimizer step"
+                #     )
 
                 # show grad norm in wandb if it's too large
                 display_grad_norm = (

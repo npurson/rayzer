@@ -13,7 +13,7 @@ model:
   rope_freq: 100
   patch_embed: dinov2_vitb14_reg
   backbone_pretrained: auto
-  freeze_backbone: true
+  freeze_backbone: false
   pose_head_depth: 4
   image_tokenizer:
     image_size: 336
@@ -28,7 +28,7 @@ model:
 training:
   amp_dtype: bf16
   api_key_path: ./configs/api_keys.yaml
-  batch_size_per_gpu: 32
+  batch_size_per_gpu: 24
   beta1: 0.9
   beta2: 0.95
   allowed_gradnorm_factor: 2.0
@@ -59,12 +59,12 @@ training:
   random_split: false
   view_selector:
     type: two_frame
-    min_frame_dist: 24
-    max_frame_dist: 72
+    min_frame_dist: 12
+    max_frame_dist: 24
     use_curriculum: true
     curriculum_iter: 30000
-    curriculum_start_min_frame_dist: 16
-    curriculum_start_max_frame_dist: 32
+    curriculum_start_min_frame_dist: 8
+    curriculum_start_max_frame_dist: 16
   num_threads: 8
   num_workers: 8
   prefetch_factor: 8
