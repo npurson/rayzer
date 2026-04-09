@@ -189,7 +189,10 @@ while cur_train_step <= total_train_steps:
     ):
         if "LVSM" in config.model.class_name:
             ret_dict = model(batch)
-        elif any(k in config.model.class_name for k in ("rayzer", "erayzer", "spa3r")):
+        elif any(
+            k in config.model.class_name
+            for k in ("rayzer", "erayzer", "spa3r", "xfactor")
+        ):
             ret_dict = model(
                 batch, create_visual=create_visual, render_video=render_video
             )
@@ -211,11 +214,26 @@ while cur_train_step <= total_train_steps:
 
     if update_grads:
         skip_optimizer_step = False
+        stepped_optimizer = False
         # Skip optimizer step if loss is NaN or Inf
         if torch.isnan(ret_dict.loss_metrics.loss) or torch.isinf(
             ret_dict.loss_metrics.loss
         ):
             print(f"NaN or Inf loss detected, skip this iteration")
+            if ddp_info.is_main_process:
+                batch_index = batch.get("index", None)
+                batch_scene = batch.get("scene_name", None)
+                image = batch.get("image", None)
+                print(f"scene_name: {batch_scene}")
+                if isinstance(batch_index, torch.Tensor):
+                    print(f"index: {batch_index.detach().cpu().tolist()}")
+                if isinstance(image, torch.Tensor):
+                    print(
+                        "image stats: "
+                        f"min={image.min().item():.6f}, "
+                        f"max={image.max().item():.6f}, "
+                        f"finite={torch.isfinite(image).all().item()}"
+                    )
             skip_optimizer_step = True
             ret_dict.loss_metrics.loss.data = torch.zeros_like(
                 ret_dict.loss_metrics.loss
@@ -284,9 +302,11 @@ while cur_train_step <= total_train_steps:
             if not skip_optimizer_step:
                 scaler.step(optimizer)
                 cur_param_update_step += 1
+                stepped_optimizer = True
 
         scaler.update()
-        lr_scheduler.step()
+        if stepped_optimizer:
+            lr_scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 
     # Create log and save checkpoint

@@ -6,6 +6,7 @@ import signal
 import traceback
 import numpy as np
 import PIL
+import PIL.Image
 import torch
 from torch.utils.data import Dataset
 import json

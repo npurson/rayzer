@@ -1,28 +1,23 @@
 model:
-  class_name: model.spa3r.Spa3R
-  embed_dim: 768
-  num_heads: 12
-  aggregator_depth: 12
-  decoder_depth: 12
-  patch_size: 14
-  image_size: 336
-  num_register_tokens: 4
-  mlp_ratio: 4.0
-  init_values: 0.01
-  qk_norm: true
-  rope_freq: 100
-  patch_embed: dinov2_vitb14_reg
-  backbone_pretrained: null
-  freeze_backbone: true
-  pose_head_depth: 4
+  class_name: model.xfactor.XFactor
+  embed_dim: 1024
+  num_heads: 16
+  aggregator_depth: 8
+  decoder_depth: 8
+  patch_size: 16
+  image_size: 256
+  pose_dim: 256
+  num_pose_tokens: 32
+  self_decode_prob: 0.05
+  full_chance: 0.05
   image_tokenizer:
-    image_size: 336
-    patch_size: 14
+    image_size: 256
+    patch_size: 16
     in_channels: 3
   target_image:
-    height: 336
-    width: 336
-    patch_size: 14
+    height: 256
+    width: 256
+    patch_size: 16
     in_channels: 6
 
 training:
@@ -34,7 +29,7 @@ training:
   allowed_gradnorm_factor: 2.0
   center_crop: true
   scene_scale_factor: 1.35
-  checkpoint_dir: ./experiments/checkpoints/spa3r_dl3dv_eval
+  checkpoint_dir: ./experiments/checkpoints/xfactor_dl3dv_eval
   checkpoint_every: 2000
   dataset_name: data.dataset_scene.Dataset
   dataset_path: data/dl3dv_benchmark.txt
@@ -45,8 +40,7 @@ training:
   l2_loss_weight: 1.0
   lpips_loss_weight: 0.0
   perceptual_loss_weight: 0.0
-  feature_loss_weight: 1.0
-  pose_align_loss_weight: 1.0
+  pose_augmentation: false
 
   lr: 0.0004
   train_steps: 100000
@@ -73,12 +67,12 @@ training:
   use_tf32: true
   vis_every: 1000
 
-  wandb_project: spa3r
-  wandb_exp_name: spa3r_dl3dv_eval
+  wandb_project: xfactor
+  wandb_exp_name: xfactor_dl3dv_eval
   wandb_log_every: 50
 
-  warmup: 3000
-  weight_decay: 0.05
+  warmup: 4000
+  weight_decay: 0.005
 
   render_video: render_video
 

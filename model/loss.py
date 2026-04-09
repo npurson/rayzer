@@ -159,14 +159,18 @@ class LossComputer(nn.Module):
         super().__init__()
         self.config = config
 
+        dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
+        is_rank0 = (not dist_ready) or torch.distributed.get_rank() == 0
+
         if self.config.training.lpips_loss_weight > 0.0:
             # avoid multiple GPUs from downloading the same LPIPS model multiple times
-            if torch.distributed.get_rank() == 0:
+            if is_rank0:
                 self.lpips_loss_module = self._init_frozen_module(
                     lpips.LPIPS(net="vgg")
                 )
-            torch.distributed.barrier()
-            if torch.distributed.get_rank() != 0:
+            if dist_ready:
+                torch.distributed.barrier()
+            if not is_rank0:
                 self.lpips_loss_module = self._init_frozen_module(
                     lpips.LPIPS(net="vgg")
                 )

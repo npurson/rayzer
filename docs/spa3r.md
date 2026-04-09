@@ -13,6 +13,6 @@ rayzer/ 是当前基于 rayzer codebase 的训练框架，rayzer/submodules/vggt
 7. pose token1、2 来源于同一个 vggt 里本身的 pose embedding，但是在训练的时候复制两份，推理的时候就不用复制也不需要mask，直接采用
 8. 以上所说的请在 rayzer/ 里实现，命名为 spa3r（Spa3R），也要能使用原有的脚本评测 psnr 和 pose。
 
-另外，请不要试图运行 python 测试等，本设备上没有 python 运行环境，你写好后我会传到其他设备运行。
+另外，运行所有 python 指令，请在前面加上 `conda activate rayzer &&`
 
 现在，请你看下你对我的设计或者背后原因理解有没有不清楚的地方，在沟通完毕后请开始实现

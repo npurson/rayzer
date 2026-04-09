@@ -126,7 +126,12 @@ def compute_ssim(
 
 
 @torch.no_grad()
-def export_results(result: edict, out_dir: str, compute_metrics: bool = False):
+def export_results(
+    result: edict,
+    out_dir: str,
+    compute_metrics: bool = False,
+    tps_oracle=None,
+):
     """
     Save results including images and optional metrics and videos.
 
@@ -134,6 +139,7 @@ def export_results(result: edict, out_dir: str, compute_metrics: bool = False):
         result: EasyDict containing input, target, and rendered images, and optionally video frames
         out_dir: Directory to save the evaluation results
         compute_metrics: Whether to compute and save metrics
+        tps_oracle: Optional VggtOracle instance for TPS evaluation
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -170,6 +176,17 @@ def export_results(result: edict, out_dir: str, compute_metrics: bool = False):
                 _save_pose_metrics(
                     result.gt_c2w[batch_idx],  # [v_all, 4, 4]
                     result.c2w[batch_idx],  # [v_all, 4, 4]
+                    sample_dir,
+                    scene_name,
+                )
+
+            # Compute TPS metrics if oracle is provided
+            if tps_oracle is not None:
+                _save_tps_metrics(
+                    tps_oracle,
+                    target_data.image[batch_idx],
+                    result.render[batch_idx],
+                    input_data.image[batch_idx],
                     sample_dir,
                     scene_name,
                 )
@@ -320,6 +337,37 @@ def _save_pose_metrics(gt_c2w, pred_c2w, out_dir, scene_name):
         json.dump(result, f, indent=2)
 
 
+def _save_tps_metrics(tps_oracle, gt_images, rendered_images, context_images, out_dir, scene_name):
+    """
+    Evaluate and save TPS (True Pose Similarity) metrics.
+
+    Args:
+        tps_oracle: VggtOracle instance
+        gt_images: [V, 3, H, W] GT target views
+        rendered_images: [V, 3, H, W] rendered target views
+        context_images: [V_ctx, 3, H, W] context (input) views
+        out_dir: directory to save metrics
+        scene_name: scene identifier
+    """
+    gt_images = gt_images.to(torch.float32)
+    rendered_images = rendered_images.to(torch.float32)
+    context_images = context_images.to(torch.float32)
+
+    tps_metrics = tps_oracle.evaluate_batch(
+        gt_images=gt_images,
+        rendered_images=rendered_images,
+        context_images=context_images,
+    )
+
+    result = {
+        "scene_name": scene_name,
+        **{k: float(v) for k, v in tps_metrics.items()},
+    }
+
+    with open(os.path.join(out_dir, "tps_metrics.json"), "w") as f:
+        json.dump(result, f, indent=2)
+
+
 def _save_video(frames, output_path):
     """
     Save video from rendered frames.
@@ -359,8 +407,10 @@ def summarize_evaluation(evaluation_folder):
 
     metrics = {}
     pose_metrics = {}
+    tps_metrics = {}
     valid_subfolders = []
     pose_valid_subfolders = []
+    tps_valid_subfolders = []
 
     for subfolder in subfolders:
         # Rendering metrics
@@ -394,6 +444,20 @@ def summarize_evaluation(evaluation_folder):
                         pose_metrics.setdefault(metric_name, []).append(metric_value)
                 except (json.JSONDecodeError, KeyError) as e:
                     print(f"Error reading pose metrics from {pose_json_path}: {e}")
+
+        # TPS metrics
+        tps_json_path = os.path.join(subfolder, "tps_metrics.json")
+        if os.path.exists(tps_json_path):
+            tps_valid_subfolders.append(subfolder)
+            with open(tps_json_path, "r") as f:
+                try:
+                    tps_data = json.load(f)
+                    for metric_name, metric_value in tps_data.items():
+                        if metric_name == "scene_name":
+                            continue
+                        tps_metrics.setdefault(metric_name, []).append(metric_value)
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"Error reading TPS metrics from {tps_json_path}: {e}")
 
     if not valid_subfolders:
         print(f"No valid metrics files found in {evaluation_folder}")
@@ -445,6 +509,34 @@ def summarize_evaluation(evaluation_folder):
         )
         print(f"[Pose] Average: {pose_avg_str}")
 
+    # === TPS metrics summary ===
+    tps_averages = []
+    if tps_metrics:
+        tps_csv_file = os.path.join(evaluation_folder, "tps_summary.csv")
+        with open(tps_csv_file, "w") as f:
+            header = ["Index"] + list(tps_metrics.keys())
+            f.write(",".join(header) + "\n")
+
+            for i, subfolder in enumerate(tps_valid_subfolders):
+                basename = os.path.basename(subfolder)
+                values = [
+                    str(metric_values[i]) for metric_values in tps_metrics.values()
+                ]
+                f.write(f"{basename},{','.join(values)}\n")
+
+            f.write("\n")
+
+            tps_averages = [
+                str(sum(values) / len(values)) for values in tps_metrics.values()
+            ]
+            f.write(f"average,{','.join(tps_averages)}\n")
+
+        print(f"[TPS] Summary written to {tps_csv_file}")
+        tps_avg_str = ", ".join(
+            f"{k}: {sum(v)/len(v):.4f}" for k, v in tps_metrics.items()
+        )
+        print(f"[TPS] Average: {tps_avg_str}")
+
     # Export combined average metrics
     with open(os.path.join(evaluation_folder, "average_metrics.txt"), "w") as f:
         render_header = list(metrics.keys())
@@ -454,3 +546,7 @@ def summarize_evaluation(evaluation_folder):
             pose_header = list(pose_metrics.keys())
             f.write(f"\n[Pose] {', '.join(pose_header)}\n")
             f.write(f"[Pose] Average: {', '.join(pose_averages)}\n")
+        if tps_metrics:
+            tps_header = list(tps_metrics.keys())
+            f.write(f"\n[TPS] {', '.join(tps_header)}\n")
+            f.write(f"[TPS] Average: {', '.join(tps_averages)}\n")

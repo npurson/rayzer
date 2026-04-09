@@ -100,6 +100,22 @@ if ddp_info.is_main_process:
 
 dist.barrier()
 
+# Initialize VGGT oracle for TPS evaluation (only on rank 0 first, then sync)
+tps_oracle = None
+if config.inference.get("compute_tps", False):
+    from utils.tps_eval import VggtOracle
+
+    if ddp_info.is_main_process:
+        tps_oracle = VggtOracle(
+            checkpoint_path=config.inference.get("vggt_checkpoint", "facebook/VGGT-1B")
+        ).to(ddp_info.device)
+    dist.barrier()
+    if not ddp_info.is_main_process:
+        tps_oracle = VggtOracle(
+            checkpoint_path=config.inference.get("vggt_checkpoint", "facebook/VGGT-1B")
+        ).to(ddp_info.device)
+    dist.barrier()
+
 
 datasampler.set_epoch(0)
 model.eval()
@@ -119,7 +135,7 @@ with torch.no_grad(), torch.autocast(
             result = model.module.render_video(
                 result, **config.inference.render_video_config
             )
-        elif any(k in config.model.class_name for k in ("rayzer", "spa3r")):
+        elif any(k in config.model.class_name for k in ("rayzer", "spa3r", "xfactor")):
             result = model(
                 batch,
                 create_visual=True,
@@ -140,6 +156,7 @@ with torch.no_grad(), torch.autocast(
             result,
             inference_out_dir,
             compute_metrics=config.inference.get("compute_metrics"),
+            tps_oracle=tps_oracle,
         )
     torch.cuda.empty_cache()
 

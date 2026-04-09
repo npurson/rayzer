@@ -45,7 +45,7 @@ training:
   l2_loss_weight: 1.0
   lpips_loss_weight: 0.0
   perceptual_loss_weight: 0.0
-  feature_loss_weight: 1.0
+  feature_loss_weight: 0.1
   pose_align_loss_weight: 1.0
 
   lr: 0.0004
@@ -85,7 +85,6 @@ training:
 inference:
   if_inference: True
   compute_metrics: True
-  compute_tps: True
   view_idx_file_path: ./data/rayzer_evaluation_index_dl3dv_even.json
   render_video: False
   render_video_config:
