@@ -182,21 +182,26 @@ while cur_train_step <= total_train_steps:
     )
     render_video = create_visual and config.training.get("render_video", False)
 
-    with torch.autocast(
-        enabled=config.training.use_amp,
-        device_type="cuda",
-        dtype=amp_dtype_mapping[config.training.amp_dtype],
-    ):
-        if "LVSM" in config.model.class_name:
-            ret_dict = model(batch)
-        elif "rayzer" in config.model.class_name:
-            ret_dict = model(
-                batch, create_visual=create_visual, render_video=render_video
-            )
-        else:
-            raise NotImplementedError(
-                f"Model {config.model.class_name} is not supported"
-            )
+    detect_anomaly = config.training.get("detect_anomaly", False)
+    with torch.autograd.set_detect_anomaly(detect_anomaly):
+        with torch.autocast(
+            enabled=config.training.use_amp,
+            device_type="cuda",
+            dtype=amp_dtype_mapping[config.training.amp_dtype],
+        ):
+            if "LVSM" in config.model.class_name:
+                ret_dict = model(batch)
+            elif any(
+                k in config.model.class_name
+                for k in ("rayzer", "erayzer", "spa3r", "xfactor")
+            ):
+                ret_dict = model(
+                    batch, create_visual=create_visual, render_video=render_video
+                )
+            else:
+                raise NotImplementedError(
+                    f"Model {config.model.class_name} is not supported"
+                )
 
     # Backward pass
     update_grads = (
@@ -211,11 +216,26 @@ while cur_train_step <= total_train_steps:
 
     if update_grads:
         skip_optimizer_step = False
+        stepped_optimizer = False
         # Skip optimizer step if loss is NaN or Inf
         if torch.isnan(ret_dict.loss_metrics.loss) or torch.isinf(
             ret_dict.loss_metrics.loss
         ):
             print(f"NaN or Inf loss detected, skip this iteration")
+            if ddp_info.is_main_process:
+                batch_index = batch.get("index", None)
+                batch_scene = batch.get("scene_name", None)
+                image = batch.get("image", None)
+                print(f"scene_name: {batch_scene}")
+                if isinstance(batch_index, torch.Tensor):
+                    print(f"index: {batch_index.detach().cpu().tolist()}")
+                if isinstance(image, torch.Tensor):
+                    print(
+                        "image stats: "
+                        f"min={image.min().item():.6f}, "
+                        f"max={image.max().item():.6f}, "
+                        f"finite={torch.isfinite(image).all().item()}"
+                    )
             skip_optimizer_step = True
             ret_dict.loss_metrics.loss.data = torch.zeros_like(
                 ret_dict.loss_metrics.loss
@@ -226,6 +246,17 @@ while cur_train_step <= total_train_steps:
         if not skip_optimizer_step:
             # Unscales the gradients
             scaler.unscale_(optimizer)
+            debug_grads = config.training.get("debug_grad_nonfinite", False)
+            if debug_grads and ddp_info.is_main_process:
+                bad_grad_names = []
+                for n, p in optimized_param_dict.items():
+                    if p.requires_grad and (p.grad is not None) and (not torch.isfinite(p.grad).all()):
+                        bad_grad_names.append(n)
+                if bad_grad_names:
+                    print("Non-finite gradients before nan_to_num:")
+                    for name in bad_grad_names[:50]:
+                        g = optimized_param_dict[name].grad
+                        print(f"  {name}: min={torch.nan_to_num(g).min().item():.6g}, max={torch.nan_to_num(g).max().item():.6g}")
             # For all gradients, we safely change the NaN -> 0., inf -> 1e-6, -inf -> 1e-6.
             with torch.no_grad():
                 for n, p in optimized_param_dict.items():
@@ -256,21 +287,21 @@ while cur_train_step <= total_train_steps:
                     optim_param_list, max_norm=config.training.grad_clip_norm
                 ).item()
 
-                if total_grad_norm > config.training.grad_clip_norm * 2.0:
-                    print(
-                        f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {config.training.grad_clip_norm * 2.0}"
-                    )
-
                 allowed_gradnorm = config.training.grad_clip_norm * config.training.get(
                     "allowed_gradnorm_factor", 5
                 )
-                if (total_grad_norm > allowed_gradnorm) and (
-                    cur_train_step > config.training.get("no_pass_steps", -1)
-                ):
-                    skip_optimizer_step = True
-                    print(
-                        f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {allowed_gradnorm}, skipping optimizer step"
-                    )
+
+                # if total_grad_norm > config.training.grad_clip_norm * 2.0:
+                #     print(
+                #         f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {config.training.grad_clip_norm * 2.0}"
+                #     )
+                # if (total_grad_norm > allowed_gradnorm) and (
+                #     cur_train_step > config.training.get("no_pass_steps", -1)
+                # ):
+                #     skip_optimizer_step = True
+                #     print(
+                #         f"WARNING: step {cur_train_step} grad norm too large {total_grad_norm} > {allowed_gradnorm}, skipping optimizer step"
+                #     )
 
                 # show grad norm in wandb if it's too large
                 display_grad_norm = (
@@ -284,9 +315,11 @@ while cur_train_step <= total_train_steps:
             if not skip_optimizer_step:
                 scaler.step(optimizer)
                 cur_param_update_step += 1
+                stepped_optimizer = True
 
         scaler.update()
-        lr_scheduler.step()
+        if stepped_optimizer:
+            lr_scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 
     # Create log and save checkpoint
@@ -349,12 +382,16 @@ while cur_train_step <= total_train_steps:
             )
 
         # export intermediate visualization results
-        if create_visual:
+        if create_visual and hasattr(ret_dict, "input") and ret_dict.input is not None:
             vis_path = os.path.join(
                 config.training.checkpoint_dir, f"iter_{cur_train_step:08d}"
             )
             os.makedirs(vis_path, exist_ok=True)
-            visualize_intermediate_results(vis_path, ret_dict)
+            supervision_image = visualize_intermediate_results(vis_path, ret_dict)
+            if supervision_image is not None:
+                logger.log_image(
+                    "train/gt_vs_pred", supervision_image, step=cur_train_step
+                )
             torch.cuda.empty_cache()
             model.train()
 

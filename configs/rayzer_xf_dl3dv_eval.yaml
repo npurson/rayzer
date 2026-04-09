@@ -1,5 +1,8 @@
 model:
-  class_name: model.rayzer.RayZer
+  class_name: model.rayzer_xf.RayZer_XF
+  self_decode_prob: 0.05
+  full_chance: 0.05
+  empty_chance: 0.0
   image_tokenizer:
     image_size: 256
     patch_size: 16    # use 8 if you have enough compute
@@ -28,16 +31,16 @@ model:
 training:
   amp_dtype: bf16
   api_key_path: ./configs/api_keys.yaml
-  batch_size_per_gpu: 8
+  batch_size_per_gpu: 1
   beta1: 0.9
   beta2: 0.95
   allowed_gradnorm_factor: 2.0
   center_crop: true
   scene_scale_factor: 1.35
-  checkpoint_dir: ./experiments/checkpoints/rayzer_dl3dv
+  checkpoint_dir: ./experiments/checkpoints/rayzer_xf_dl3dv_eval
   checkpoint_every: 2000
   dataset_name: data.dataset_scene.Dataset
-  dataset_path: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/rayzer/dl3dv_10k_train.txt
+  dataset_path: data/dl3dv_benchmark.txt
   grad_accum_steps: 1
   grad_checkpoint_every: 1
   grad_clip_norm: 1.0
@@ -45,6 +48,7 @@ training:
   l2_loss_weight: 1.0
   lpips_loss_weight: 0.0
   perceptual_loss_weight: 0.2
+  smooth_l1_beta: 0.05
 
   lr: 0.0004
   train_steps: 100000
@@ -59,7 +63,7 @@ training:
     type: two_frame
     min_frame_dist: 64
     max_frame_dist: 96
-    use_curriculum: true
+    use_curriculum: false
     curriculum_iter: 30000
     curriculum_start_min_frame_dist: 48
     curriculum_start_max_frame_dist: 64
@@ -74,9 +78,8 @@ training:
   use_tf32: true
   vis_every: 1000
 
-  log_backend: tensorboard
   wandb_project: rayzer
-  wandb_exp_name: rayzer_dl3dv
+  wandb_exp_name: rayzer_xf_dl3dv_eval
   wandb_log_every: 50
 
   warmup: 3000
@@ -84,10 +87,11 @@ training:
 
   render_video: render_video
 
-# inference / evaluation
+# inference / evaluation (enabled for evaluation)
 inference:
-  if_inference: False
-  compute_metrics: False
+  if_inference: True
+  compute_tps: True
+  compute_metrics: True
   view_idx_file_path: ./data/rayzer_evaluation_index_dl3dv_even.json
   render_video: False
   render_video_config:
